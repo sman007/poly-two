@@ -57,7 +57,7 @@ const MAX_SLIPPAGE: Decimal = Decimal::from_parts(2, 0, 0, false, 3);
 const FALLBACK_TIMESTAMP: u64 = 1704067200;
 
 /// Dashboard web server port
-const DASHBOARD_PORT: u16 = 8080;
+const DASHBOARD_PORT: u16 = 8081;
 
 // ============================================================================
 // CONFIGURATION
