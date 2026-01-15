@@ -138,6 +138,12 @@ struct BotState {
     paper_entry_prices: HashMap<String, Decimal>,
     // Recent fills for dashboard display
     recent_fills: Vec<FillRecord>,
+    // Performance stats
+    api_latency_ms: u64,
+    ws_connected: bool,
+    loop_count: u64,
+    orders_placed: u64,
+    last_error: Option<String>,
 }
 
 /// Record of a paper fill for dashboard display
@@ -168,6 +174,13 @@ struct DashboardData {
     tracked_positions: usize,
     recent_fills: Vec<FillRecord>,
     timestamp: String,
+    // New stats
+    market_count: usize,
+    api_latency_ms: u64,
+    ws_connected: bool,
+    loop_count: u64,
+    orders_placed: u64,
+    last_error: Option<String>,
 }
 
 /// Shared state for web dashboard
@@ -176,6 +189,7 @@ struct AppState {
     bot_state: Arc<RwLock<BotState>>,
     config: Config,
     start_time: Instant,
+    market_count: usize,
 }
 
 /// WebSocket context for listener tasks
@@ -229,6 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let start_time = Instant::now();
+    let market_count = config.market_pairs.len();
     let state = Arc::new(RwLock::new(BotState {
         balance: if config.paper_trade { config.paper_starting_balance } else { Decimal::ZERO },
         exposure: HashMap::new(),
@@ -242,6 +257,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         paper_order_count: 0,
         paper_entry_prices: HashMap::new(),
         recent_fills: Vec::new(),
+        api_latency_ms: 0,
+        ws_connected: false,
+        loop_count: 0,
+        orders_placed: 0,
+        last_error: None,
     }));
 
     if config.paper_trade {
@@ -293,6 +313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bot_state: state.clone(),
         config: config.clone(),
         start_time,
+        market_count,
     };
     tokio::spawn(async move {
         run_dashboard_server(app_state).await;
@@ -327,6 +348,12 @@ async fn run_main_loop_iteration<S: Signer + Sync>(
     config: &Config,
     shutdown_token: &CancellationToken,
 ) {
+    // Increment loop counter
+    {
+        let mut locked = state.write().await;
+        locked.loop_count += 1;
+    }
+
     // In paper mode, use simulated balance instead of fetching from API
     let current_balance = if config.paper_trade {
         let locked = state.read().await;
@@ -972,6 +999,8 @@ async fn provide_liquidity<S: Signer + Sync>(
     no_token: &str,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Track API latency
+    let start = Instant::now();
     let book_yes = client
         .order_book(
             &OrderBookSummaryRequest::builder()
@@ -986,6 +1015,13 @@ async fn provide_liquidity<S: Signer + Sync>(
                 .build(),
         )
         .await?;
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    // Update latency in state
+    {
+        let mut locked = state.write().await;
+        locked.api_latency_ms = latency_ms;
+    }
 
     let Some((best_bid_yes, best_ask_yes)) = best_bid_ask(&book_yes) else {
         warn!("Skipping {}: empty orderbook", yes_token);
@@ -1132,6 +1168,9 @@ async fn provide_liquidity<S: Signer + Sync>(
             locked.open_orders.insert(id.clone(), now);
         }
 
+        // Track total orders placed
+        locked.orders_placed += order_ids.len() as u64;
+
         // Store paper orders for fill simulation
         if config.paper_trade {
             for po in paper_orders_to_add {
@@ -1221,42 +1260,61 @@ async fn run_ws_session<S: Signer + Sync>(
     let ws_client = WsClient::default().authenticate(ctx.credentials.clone(), ctx.address)?;
     let mut stream = Box::pin(ws_client.subscribe_trades(ctx.markets.clone())?);
 
-    loop {
-        tokio::select! {
-            _ = ctx.shutdown.cancelled() => {
-                info!("WebSocket session received shutdown signal");
-                return Ok(());
-            }
-            event = stream.next() => {
-                match event {
-                    Some(Ok(trade)) => {
-                        // Process trade and check if rehedging is needed
-                        let rehedge_info = {
-                            let mut locked = ctx.state.write().await;
-                            process_trade_sync(&mut locked, &trade, &ctx.config)
-                        };
+    // Mark WebSocket as connected
+    {
+        let mut locked = ctx.state.write().await;
+        locked.ws_connected = true;
+    }
 
-                        // If rehedging is needed, do it asynchronously (lock released)
-                        if let Some((token_id, exposure)) = rehedge_info {
-                            if let Err(e) = rehedge_position(&ctx.client, ctx.signer.as_ref(), &token_id, exposure, &ctx.config).await {
-                                warn!("Rehedge failed for {}: {:?}", token_id, e);
+    let result = async {
+        loop {
+            tokio::select! {
+                _ = ctx.shutdown.cancelled() => {
+                    info!("WebSocket session received shutdown signal");
+                    return Ok(());
+                }
+                event = stream.next() => {
+                    match event {
+                        Some(Ok(trade)) => {
+                            // Process trade and check if rehedging is needed
+                            let rehedge_info = {
+                                let mut locked = ctx.state.write().await;
+                                process_trade_sync(&mut locked, &trade, &ctx.config)
+                            };
+
+                            // If rehedging is needed, do it asynchronously (lock released)
+                            if let Some((token_id, exposure)) = rehedge_info {
+                                if let Err(e) = rehedge_position(&ctx.client, ctx.signer.as_ref(), &token_id, exposure, &ctx.config).await {
+                                    warn!("Rehedge failed for {}: {:?}", token_id, e);
+                                }
                             }
                         }
-                    }
-                    Some(Err(e)) => {
-                        // Return ALL errors to trigger reconnection
-                        // Don't try to be clever about which errors are "recoverable"
-                        warn!("WebSocket stream error, reconnecting: {:?}", e);
-                        return Err(e.into());
-                    }
-                    None => {
-                        info!("WebSocket stream ended");
-                        return Err("WebSocket stream ended".into());
+                        Some(Err(e)) => {
+                            // Return ALL errors to trigger reconnection
+                            // Don't try to be clever about which errors are "recoverable"
+                            warn!("WebSocket stream error, reconnecting: {:?}", e);
+                            return Err(e.into());
+                        }
+                        None => {
+                            info!("WebSocket stream ended");
+                            return Err("WebSocket stream ended".into());
+                        }
                     }
                 }
             }
         }
+    }.await;
+
+    // Mark WebSocket as disconnected on exit
+    {
+        let mut locked = ctx.state.write().await;
+        locked.ws_connected = false;
+        if let Err(ref e) = result {
+            locked.last_error = Some(format!("{:?}", e));
+        }
     }
+
+    result
 }
 
 /// Process a trade and return rehedge info if needed: Some((token_id, exposure))
@@ -1660,6 +1718,12 @@ async fn api_handler(State(app_state): State<AppState>) -> Json<DashboardData> {
         tracked_positions: locked.exposure.len(),
         recent_fills: locked.recent_fills.iter().rev().take(20).cloned().collect(),
         timestamp: Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        market_count: app_state.market_count,
+        api_latency_ms: locked.api_latency_ms,
+        ws_connected: locked.ws_connected,
+        loop_count: locked.loop_count,
+        orders_placed: locked.orders_placed,
+        last_error: locked.last_error.clone(),
     })
 }
 
@@ -1795,6 +1859,34 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       </div>
     </div>
 
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-label">Markets</div>
+        <div class="stat-value" id="markets">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">WebSocket</div>
+        <div class="stat-value" id="ws-status">--</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">API Latency</div>
+        <div class="stat-value" id="latency">--</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Loop Count</div>
+        <div class="stat-value" id="loops">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Orders Placed</div>
+        <div class="stat-value" id="orders-placed">0</div>
+      </div>
+    </div>
+
+    <div id="error-panel" class="panel" style="display:none; border-color: var(--danger);">
+      <h2 style="color: var(--danger);">Last Error</h2>
+      <div id="last-error" style="font-family: 'SF Mono', monospace; font-size: 13px; color: var(--danger);"></div>
+    </div>
+
     <div class="panel">
       <h2>Recent Fills</h2>
       <table>
@@ -1844,6 +1936,25 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         document.getElementById('orders').textContent = d.open_orders;
         document.getElementById('positions').textContent = d.tracked_positions;
         document.getElementById('fees').textContent = '$' + d.fees_paid;
+
+        // New stats
+        document.getElementById('markets').textContent = d.market_count;
+        const wsEl = document.getElementById('ws-status');
+        wsEl.textContent = d.ws_connected ? 'Connected' : 'Disconnected';
+        wsEl.style.color = d.ws_connected ? 'var(--accent)' : 'var(--danger)';
+        document.getElementById('latency').textContent = d.api_latency_ms + 'ms';
+        document.getElementById('loops').textContent = d.loop_count.toLocaleString();
+        document.getElementById('orders-placed').textContent = d.orders_placed;
+
+        // Error panel
+        const errorPanel = document.getElementById('error-panel');
+        if (d.last_error) {
+          errorPanel.style.display = 'block';
+          document.getElementById('last-error').textContent = d.last_error;
+        } else {
+          errorPanel.style.display = 'none';
+        }
+
         document.getElementById('timestamp').textContent = 'Last updated: ' + d.timestamp;
 
         const tbody = document.getElementById('fills-table');
