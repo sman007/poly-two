@@ -84,6 +84,10 @@ struct Config {
     cleanup_interval_secs: u64,
     max_tracked_orders: usize,
     max_tracked_exposures: usize,
+
+    // Paper trading
+    paper_trade: bool,
+    paper_starting_balance: Decimal,
 }
 
 // ============================================================================
@@ -94,6 +98,11 @@ struct BotState {
     balance: Decimal,
     exposure: HashMap<String, Decimal>,
     open_orders: HashMap<String, u64>,
+    // Paper trading state
+    paper_balance: Decimal,
+    paper_pnl: Decimal,
+    paper_rebates: Decimal,
+    paper_order_count: u64,
 }
 
 /// WebSocket context for listener tasks
@@ -147,10 +156,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let state = Arc::new(RwLock::new(BotState {
-        balance: Decimal::ZERO,
+        balance: if config.paper_trade { config.paper_starting_balance } else { Decimal::ZERO },
         exposure: HashMap::new(),
         open_orders: HashMap::new(),
+        paper_balance: config.paper_starting_balance,
+        paper_pnl: Decimal::ZERO,
+        paper_rebates: Decimal::ZERO,
+        paper_order_count: 0,
     }));
+
+    if config.paper_trade {
+        info!("=== PAPER TRADING MODE === Starting balance: ${}", config.paper_starting_balance);
+    }
 
     let tokens: Vec<String> = config
         .market_pairs
@@ -215,32 +232,39 @@ async fn run_main_loop_iteration<S: Signer + Sync>(
     config: &Config,
     shutdown_token: &CancellationToken,
 ) {
-    // Fetch balance with timeout
-    let current_balance = match timeout(
-        Duration::from_secs(config.api_timeout_secs),
-        fetch_usdc_balance(client),
-    )
-    .await
-    {
-        Ok(Ok(b)) => b,
-        Ok(Err(e)) => {
-            warn!("Failed to fetch balance: {:?}", e);
-            sleep(Duration::from_millis(config.main_loop_interval_ms)).await;
-            return;
-        }
-        Err(_) => {
-            warn!(
-                "Balance fetch timed out after {}s",
-                config.api_timeout_secs
-            );
-            sleep(Duration::from_millis(config.main_loop_interval_ms)).await;
-            return;
+    // In paper mode, use simulated balance instead of fetching from API
+    let current_balance = if config.paper_trade {
+        let locked = state.read().await;
+        locked.paper_balance
+    } else {
+        // Fetch real balance with timeout
+        match timeout(
+            Duration::from_secs(config.api_timeout_secs),
+            fetch_usdc_balance(client),
+        )
+        .await
+        {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                warn!("Failed to fetch balance: {:?}", e);
+                sleep(Duration::from_millis(config.main_loop_interval_ms)).await;
+                return;
+            }
+            Err(_) => {
+                warn!(
+                    "Balance fetch timed out after {}s",
+                    config.api_timeout_secs
+                );
+                sleep(Duration::from_millis(config.main_loop_interval_ms)).await;
+                return;
+            }
         }
     };
 
     if current_balance < config.min_balance {
         error!(
-            "Balance too low: {} (minimum: {}). Shutting down.",
+            "{}Balance too low: {} (minimum: {}). Shutting down.",
+            if config.paper_trade { "[PAPER] " } else { "" },
             current_balance, config.min_balance
         );
         shutdown_token.cancel();
@@ -601,6 +625,12 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
         return Err("MAX_TRACKED_EXPOSURES must be > 0".into());
     }
 
+    // Paper trading configuration
+    let paper_trade = env::var("PAPER_TRADE")
+        .map(|v| v.to_lowercase() == "true" || v == "1")
+        .unwrap_or(false);
+    let paper_starting_balance = parse_decimal_env("PAPER_STARTING_BALANCE", "1000.0")?;
+
     Ok(Config {
         wallet_private_key,
         min_balance,
@@ -624,6 +654,8 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
         cleanup_interval_secs,
         max_tracked_orders,
         max_tracked_exposures,
+        paper_trade,
+        paper_starting_balance,
     })
 }
 
@@ -755,7 +787,20 @@ async fn place_single_order<S: Signer + Sync>(
     price: Decimal,
     size: Decimal,
     label: &str,
+    paper_trade: bool,
+    paper_order_num: u64,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    // Paper trading mode - log and return fake order ID
+    if paper_trade {
+        let order_id = format!("PAPER-{:06}", paper_order_num);
+        info!(
+            "[PAPER] {} order: {} {} @ {} (id: {})",
+            label, size, token, price, order_id
+        );
+        return Ok(Some(order_id));
+    }
+
+    // Real trading mode
     let order = client
         .limit_order()
         .token_id(token)
@@ -893,16 +938,26 @@ async fn provide_liquidity<S: Signer + Sync>(
     let buy_no_price = quantize_price(mid_no - config.offset * no_buy_skew, tick_no, false);
     let sell_no_price = quantize_price(mid_no + config.offset * no_sell_skew, tick_no, true);
 
+    // Get paper order count for IDs (if in paper mode)
+    let base_order_num = if config.paper_trade {
+        let mut locked = state.write().await;
+        let num = locked.paper_order_count;
+        locked.paper_order_count += 4; // Reserve 4 order numbers
+        num
+    } else {
+        0
+    };
+
     // Place all 4 orders in parallel for better performance
     let order_specs = [
-        (yes_token, Side::Buy, buy_yes_price, "Buy YES"),
-        (yes_token, Side::Sell, sell_yes_price, "Sell YES"),
-        (no_token, Side::Buy, buy_no_price, "Buy NO"),
-        (no_token, Side::Sell, sell_no_price, "Sell NO"),
+        (yes_token, Side::Buy, buy_yes_price, "Buy YES", base_order_num),
+        (yes_token, Side::Sell, sell_yes_price, "Sell YES", base_order_num + 1),
+        (no_token, Side::Buy, buy_no_price, "Buy NO", base_order_num + 2),
+        (no_token, Side::Sell, sell_no_price, "Sell NO", base_order_num + 3),
     ];
 
-    let order_futures = order_specs.map(|(token, side, price, label)| {
-        place_single_order(client, signer, token, side, price, size, label)
+    let order_futures = order_specs.map(|(token, side, price, label, order_num)| {
+        place_single_order(client, signer, token, side, price, size, label, config.paper_trade, order_num)
     });
 
     let results = futures_util::future::join_all(order_futures).await;
@@ -923,13 +978,22 @@ async fn provide_liquidity<S: Signer + Sync>(
     if !order_ids.is_empty() {
         let now = systemtime_now_secs();
         let mut locked = state.write().await;
-        for id in order_ids {
-            locked.open_orders.insert(id, now);
+        for id in &order_ids {
+            locked.open_orders.insert(id.clone(), now);
+        }
+
+        // In paper mode, log summary
+        if config.paper_trade {
+            info!(
+                "[PAPER] Placed {} orders. Paper balance: ${}, Total rebates: ${}",
+                order_ids.len(), locked.paper_balance, locked.paper_rebates
+            );
         }
     }
 
     info!(
-        "Placed hedged quotes with size {} for YES {} and NO {}",
+        "{}Placed hedged quotes with size {} for YES {} and NO {}",
+        if config.paper_trade { "[PAPER] " } else { "" },
         size, yes_token, no_token
     );
     Ok(())
@@ -1136,6 +1200,16 @@ async fn rehedge_position<S: Signer + Sync>(
         (Side::Buy, best_ask)
     };
 
+    // Paper trading mode - just log the rehedge
+    if config.paper_trade {
+        info!(
+            "[PAPER] Rehedge order: {:?} {} @ {} for token {}",
+            side, rehedge_size, price, token_id
+        );
+        return Ok(());
+    }
+
+    // Real trading mode
     info!(
         "Placing rehedge order: {:?} {} @ {} for token {}",
         side, rehedge_size, price, token_id
