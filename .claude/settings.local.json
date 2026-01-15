@@ -8,7 +8,11 @@
       "Bash(git add:*)",
       "Bash(git commit:*)",
       "Bash(cat:*)",
-      "Bash(ssh:*)"
+      "Bash(ssh:*)",
+      "Bash(git push)",
+      "Bash(cargo build:*)",
+      "WebSearch",
+      "WebFetch(domain:gamma-api.polymarket.com)"
     ],
     "deny": [],
     "ask": []

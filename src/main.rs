@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use axum::{extract::State, response::Html, routing::get, Json, Router};
+use chrono::Utc;
 use dotenv::dotenv;
 use futures_util::StreamExt;
 use log::{error, info, warn};
@@ -20,6 +23,7 @@ use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk::types::{Address, Decimal};
 use polymarket_client_sdk::POLYGON;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use serde::Serialize;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -51,6 +55,9 @@ const MAX_SLIPPAGE: Decimal = Decimal::from_parts(2, 0, 0, false, 3);
 
 /// Fallback timestamp when system clock has issues (2024-01-01 00:00:00 UTC)
 const FALLBACK_TIMESTAMP: u64 = 1704067200;
+
+/// Dashboard web server port
+const DASHBOARD_PORT: u16 = 8080;
 
 // ============================================================================
 // CONFIGURATION
@@ -129,6 +136,46 @@ struct BotState {
     paper_order_count: u64,
     // Track entry prices for P&L calculation
     paper_entry_prices: HashMap<String, Decimal>,
+    // Recent fills for dashboard display
+    recent_fills: Vec<FillRecord>,
+}
+
+/// Record of a paper fill for dashboard display
+#[derive(Clone, Debug, Serialize)]
+struct FillRecord {
+    time: String,
+    side: String,
+    size: String,
+    price: String,
+    value: String,
+    rebate: String,
+    pnl: String,
+}
+
+/// Dashboard API response
+#[derive(Serialize)]
+struct DashboardData {
+    paper_mode: bool,
+    uptime_secs: u64,
+    starting_balance: String,
+    current_balance: String,
+    total_return_pct: String,
+    realized_pnl: String,
+    rebates_earned: String,
+    fees_paid: String,
+    total_fills: u64,
+    open_orders: usize,
+    tracked_positions: usize,
+    recent_fills: Vec<FillRecord>,
+    timestamp: String,
+}
+
+/// Shared state for web dashboard
+#[derive(Clone)]
+struct AppState {
+    bot_state: Arc<RwLock<BotState>>,
+    config: Config,
+    start_time: Instant,
 }
 
 /// WebSocket context for listener tasks
@@ -181,6 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_clone.cancel();
     });
 
+    let start_time = Instant::now();
     let state = Arc::new(RwLock::new(BotState {
         balance: if config.paper_trade { config.paper_starting_balance } else { Decimal::ZERO },
         exposure: HashMap::new(),
@@ -193,6 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         paper_realized_pnl: Decimal::ZERO,
         paper_order_count: 0,
         paper_entry_prices: HashMap::new(),
+        recent_fills: Vec::new(),
     }));
 
     if config.paper_trade {
@@ -237,6 +286,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::spawn(async move {
         periodic_cleanup(cleanup_state, cleanup_shutdown, cleanup_config).await;
+    });
+
+    // Spawn dashboard web server
+    let app_state = AppState {
+        bot_state: state.clone(),
+        config: config.clone(),
+        start_time,
+    };
+    tokio::spawn(async move {
+        run_dashboard_server(app_state).await;
     });
 
     // Main loop with shutdown support
@@ -1356,6 +1415,34 @@ fn simulate_paper_fills(state: &mut BotState, trade: &TradeMessage, _config: &Co
             trade_remaining -= fill_size;
             state.paper_fills += 1;
 
+            // Calculate P&L for this fill (for display)
+            let fill_pnl = if order.side == Side::Sell {
+                if let Some(entry_price) = state.paper_entry_prices.get(&order.token_id) {
+                    (fill_price - *entry_price) * fill_size
+                } else {
+                    Decimal::ZERO
+                }
+            } else {
+                Decimal::ZERO
+            };
+
+            // Record fill for dashboard
+            let fill_record = FillRecord {
+                time: Utc::now().format("%H:%M:%S").to_string(),
+                side: if order.side == Side::Buy { "BUY".to_string() } else { "SELL".to_string() },
+                size: format!("{:.2}", fill_size),
+                price: format!("{:.4}", fill_price),
+                value: format!("${:.2}", fill_value),
+                rebate: format!("${:.4}", rebate),
+                pnl: if fill_pnl != Decimal::ZERO { format!("${:.2}", fill_pnl) } else { "-".to_string() },
+            };
+            state.recent_fills.push(fill_record);
+
+            // Keep only last 100 fills
+            if state.recent_fills.len() > 100 {
+                state.recent_fills.remove(0);
+            }
+
             info!(
                 "[PAPER] FILL: {} {} @ {:.4} (slippage: {:.4}%) | Value: ${:.2} | Rebate: ${:.4}",
                 if order.side == Side::Buy { "BUY" } else { "SELL" },
@@ -1525,6 +1612,260 @@ fn systemtime_now_secs() -> u64 {
         }
     }
 }
+
+// ============================================================================
+// DASHBOARD WEB SERVER
+// ============================================================================
+
+async fn run_dashboard_server(app_state: AppState) {
+    let app = Router::new()
+        .route("/", get(dashboard_handler))
+        .route("/api/data", get(api_handler))
+        .with_state(app_state);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], DASHBOARD_PORT));
+    info!("Dashboard server starting on http://0.0.0.0:{}", DASHBOARD_PORT);
+
+    if let Err(e) = axum::serve(
+        tokio::net::TcpListener::bind(addr).await.unwrap(),
+        app,
+    )
+    .await
+    {
+        error!("Dashboard server error: {:?}", e);
+    }
+}
+
+async fn api_handler(State(app_state): State<AppState>) -> Json<DashboardData> {
+    let locked = app_state.bot_state.read().await;
+    let starting = app_state.config.paper_starting_balance;
+    let current = locked.paper_balance;
+    let return_pct = if starting > Decimal::ZERO {
+        ((current - starting) / starting) * Decimal::from(100)
+    } else {
+        Decimal::ZERO
+    };
+
+    Json(DashboardData {
+        paper_mode: app_state.config.paper_trade,
+        uptime_secs: app_state.start_time.elapsed().as_secs(),
+        starting_balance: format!("{:.2}", starting),
+        current_balance: format!("{:.2}", current),
+        total_return_pct: format!("{:.2}", return_pct),
+        realized_pnl: format!("{:.2}", locked.paper_realized_pnl),
+        rebates_earned: format!("{:.4}", locked.paper_rebates_earned),
+        fees_paid: format!("{:.4}", locked.paper_fees_paid),
+        total_fills: locked.paper_fills,
+        open_orders: locked.paper_orders.len(),
+        tracked_positions: locked.exposure.len(),
+        recent_fills: locked.recent_fills.iter().rev().take(20).cloned().collect(),
+        timestamp: Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+    })
+}
+
+async fn dashboard_handler(State(_app_state): State<AppState>) -> Html<String> {
+    Html(DASHBOARD_HTML.to_string())
+}
+
+const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Poly-Two Dashboard</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --bg-secondary: #161b22;
+      --bg-tertiary: #21262d;
+      --border: #30363d;
+      --text: #f0f6fc;
+      --muted: #8b949e;
+      --accent: #3fb950;
+      --danger: #f85149;
+      --warn: #d29922;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 20px;
+      background: var(--bg); color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+    .container { max-width: 1200px; margin: 0 auto; }
+    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+    h1 { font-size: 24px; margin: 0; }
+    .badge { padding: 6px 14px; border-radius: 6px; font-weight: 600; font-size: 12px; text-transform: uppercase; }
+    .badge.paper { background: var(--warn); color: #000; }
+    .badge.live { background: var(--danger); color: #fff; }
+
+    .pnl-hero {
+      background: linear-gradient(135deg, var(--bg-secondary), var(--bg-tertiary));
+      border: 2px solid var(--accent);
+      border-radius: 12px;
+      padding: 32px;
+      margin-bottom: 20px;
+      text-align: center;
+    }
+    .pnl-main {
+      font-size: 56px;
+      font-weight: 800;
+      font-family: 'SF Mono', monospace;
+      margin-bottom: 8px;
+    }
+    .pnl-positive { color: var(--accent); text-shadow: 0 0 30px rgba(63,185,80,0.4); }
+    .pnl-negative { color: var(--danger); text-shadow: 0 0 30px rgba(248,81,73,0.4); }
+    .pnl-label { color: var(--muted); font-size: 14px; text-transform: uppercase; letter-spacing: 1px; }
+
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 20px; }
+    .stat-card {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px;
+    }
+    .stat-label { color: var(--muted); font-size: 12px; text-transform: uppercase; margin-bottom: 8px; }
+    .stat-value { font-size: 24px; font-weight: 700; font-family: 'SF Mono', monospace; }
+    .stat-value.positive { color: var(--accent); }
+    .stat-value.negative { color: var(--danger); }
+
+    .panel {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+    .panel h2 { font-size: 14px; color: var(--muted); margin: 0 0 16px 0; text-transform: uppercase; }
+
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
+    th { color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 11px; }
+    td { font-family: 'SF Mono', monospace; }
+    tr:hover { background: var(--bg-tertiary); }
+    .fill-buy { color: var(--accent); }
+    .fill-sell { color: var(--danger); }
+
+    .uptime { color: var(--muted); font-size: 13px; }
+    .last-update { color: var(--muted); font-size: 12px; text-align: center; margin-top: 20px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>Poly-Two</h1>
+      <div>
+        <span class="badge" id="mode">PAPER</span>
+        <span class="uptime" id="uptime">0h 0m</span>
+      </div>
+    </div>
+
+    <div class="pnl-hero">
+      <div class="pnl-main pnl-positive" id="balance">$1000.00</div>
+      <div class="pnl-label">Current Balance</div>
+      <div style="margin-top:20px; display:flex; justify-content:center; gap:40px;">
+        <div><span style="font-size:28px; font-weight:700;" id="return-pct">0.00%</span><br><span class="pnl-label">Return</span></div>
+        <div><span style="font-size:28px; font-weight:700;" id="pnl">$0.00</span><br><span class="pnl-label">Realized P&L</span></div>
+      </div>
+    </div>
+
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-label">Starting Balance</div>
+        <div class="stat-value" id="starting">$1000.00</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Total Fills</div>
+        <div class="stat-value" id="fills">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Rebates Earned</div>
+        <div class="stat-value positive" id="rebates">$0.0000</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Open Orders</div>
+        <div class="stat-value" id="orders">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Positions</div>
+        <div class="stat-value" id="positions">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Fees Paid</div>
+        <div class="stat-value" id="fees">$0.0000</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Recent Fills</h2>
+      <table>
+        <thead><tr><th>Time</th><th>Side</th><th>Size</th><th>Price</th><th>Value</th><th>Rebate</th><th>P&L</th></tr></thead>
+        <tbody id="fills-table"></tbody>
+      </table>
+    </div>
+
+    <div class="last-update" id="timestamp">Loading...</div>
+  </div>
+
+  <script>
+    function formatUptime(secs) {
+      const h = Math.floor(secs / 3600);
+      const m = Math.floor((secs % 3600) / 60);
+      return h + 'h ' + m + 'm';
+    }
+
+    async function load() {
+      try {
+        const resp = await fetch('/api/data');
+        const d = await resp.json();
+
+        document.getElementById('mode').textContent = d.paper_mode ? 'PAPER' : 'LIVE';
+        document.getElementById('mode').className = 'badge ' + (d.paper_mode ? 'paper' : 'live');
+        document.getElementById('uptime').textContent = formatUptime(d.uptime_secs);
+
+        const bal = parseFloat(d.current_balance);
+        const start = parseFloat(d.starting_balance);
+        const balEl = document.getElementById('balance');
+        balEl.textContent = '$' + d.current_balance;
+        balEl.className = 'pnl-main ' + (bal >= start ? 'pnl-positive' : 'pnl-negative');
+
+        const retEl = document.getElementById('return-pct');
+        const retPct = parseFloat(d.total_return_pct);
+        retEl.textContent = d.total_return_pct + '%';
+        retEl.style.color = retPct >= 0 ? 'var(--accent)' : 'var(--danger)';
+
+        const pnlEl = document.getElementById('pnl');
+        const pnl = parseFloat(d.realized_pnl);
+        pnlEl.textContent = '$' + d.realized_pnl;
+        pnlEl.style.color = pnl >= 0 ? 'var(--accent)' : 'var(--danger)';
+
+        document.getElementById('starting').textContent = '$' + d.starting_balance;
+        document.getElementById('fills').textContent = d.total_fills;
+        document.getElementById('rebates').textContent = '$' + d.rebates_earned;
+        document.getElementById('orders').textContent = d.open_orders;
+        document.getElementById('positions').textContent = d.tracked_positions;
+        document.getElementById('fees').textContent = '$' + d.fees_paid;
+        document.getElementById('timestamp').textContent = 'Last updated: ' + d.timestamp;
+
+        const tbody = document.getElementById('fills-table');
+        if (d.recent_fills.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted);">No fills yet</td></tr>';
+        } else {
+          tbody.innerHTML = d.recent_fills.map(f => {
+            const sideClass = f.side === 'BUY' ? 'fill-buy' : 'fill-sell';
+            return '<tr><td>' + f.time + '</td><td class="' + sideClass + '">' + f.side + '</td><td>' + f.size + '</td><td>' + f.price + '</td><td>' + f.value + '</td><td>' + f.rebate + '</td><td>' + f.pnl + '</td></tr>';
+          }).join('');
+        }
+      } catch(e) {
+        console.error('Failed to load data:', e);
+      }
+    }
+
+    load();
+    setInterval(load, 3000);
+  </script>
+</body>
+</html>
+"##;
 
 // Required for Decimal::from_str
 use std::str::FromStr;
