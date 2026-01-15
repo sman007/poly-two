@@ -40,6 +40,15 @@ const SKEW_FACTOR: Decimal = Decimal::from_parts(5, 0, 0, false, 1);
 /// Fraction of exposure to rehedge (0.8 = 80%)
 const REHEDGE_FRACTION: Decimal = Decimal::from_parts(8, 0, 0, false, 1);
 
+/// Maker rebate rate (0.5% = 0.005)
+const MAKER_REBATE_RATE: Decimal = Decimal::from_parts(5, 0, 0, false, 3);
+
+/// Taker fee rate (0.5% = 0.005)
+const TAKER_FEE_RATE: Decimal = Decimal::from_parts(5, 0, 0, false, 3);
+
+/// Maximum slippage for paper trades (0.2% = 0.002)
+const MAX_SLIPPAGE: Decimal = Decimal::from_parts(2, 0, 0, false, 3);
+
 /// Fallback timestamp when system clock has issues (2024-01-01 00:00:00 UTC)
 const FALLBACK_TIMESTAMP: u64 = 1704067200;
 
@@ -94,15 +103,32 @@ struct Config {
 // STATE
 // ============================================================================
 
+/// A simulated paper order for fill tracking
+#[derive(Clone, Debug)]
+struct PaperOrder {
+    id: String,
+    token_id: String,
+    side: Side,
+    price: Decimal,
+    size: Decimal,
+    filled: Decimal,
+    created_at: u64,
+}
+
 struct BotState {
     balance: Decimal,
     exposure: HashMap<String, Decimal>,
     open_orders: HashMap<String, u64>,
     // Paper trading state
     paper_balance: Decimal,
-    paper_pnl: Decimal,
-    paper_rebates: Decimal,
+    paper_orders: HashMap<String, PaperOrder>,
+    paper_fills: u64,
+    paper_rebates_earned: Decimal,
+    paper_fees_paid: Decimal,
+    paper_realized_pnl: Decimal,
     paper_order_count: u64,
+    // Track entry prices for P&L calculation
+    paper_entry_prices: HashMap<String, Decimal>,
 }
 
 /// WebSocket context for listener tasks
@@ -160,13 +186,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         exposure: HashMap::new(),
         open_orders: HashMap::new(),
         paper_balance: config.paper_starting_balance,
-        paper_pnl: Decimal::ZERO,
-        paper_rebates: Decimal::ZERO,
+        paper_orders: HashMap::new(),
+        paper_fills: 0,
+        paper_rebates_earned: Decimal::ZERO,
+        paper_fees_paid: Decimal::ZERO,
+        paper_realized_pnl: Decimal::ZERO,
         paper_order_count: 0,
+        paper_entry_prices: HashMap::new(),
     }));
 
     if config.paper_trade {
-        info!("=== PAPER TRADING MODE === Starting balance: ${}", config.paper_starting_balance);
+        info!("══════════════════════════════════════════════════════════════");
+        info!("   PAPER TRADING MODE - NO REAL ORDERS WILL BE PLACED");
+        info!("   Starting balance: ${}", config.paper_starting_balance);
+        info!("   Maker rebate: {}%  |  Taker fee: {}%",
+              MAKER_REBATE_RATE * Decimal::from(100),
+              TAKER_FEE_RATE * Decimal::from(100));
+        info!("══════════════════════════════════════════════════════════════");
     }
 
     let tokens: Vec<String> = config
@@ -495,6 +531,43 @@ async fn periodic_cleanup(
                     }
                 }
 
+                // Paper trading: clean up stale paper orders and print summary
+                if config.paper_trade {
+                    let before_paper = locked.paper_orders.len();
+                    locked.paper_orders.retain(|_, order| {
+                        now.saturating_sub(order.created_at) < max_age
+                    });
+                    let removed_paper = before_paper - locked.paper_orders.len();
+
+                    // Periodic paper trading summary
+                    let starting_bal = config.paper_starting_balance;
+                    let current_bal = locked.paper_balance;
+                    let total_return = if starting_bal > Decimal::ZERO {
+                        ((current_bal - starting_bal) / starting_bal) * Decimal::from(100)
+                    } else {
+                        Decimal::ZERO
+                    };
+
+                    info!("═══════════════════════════════════════════════════════════════");
+                    info!("   PAPER TRADING SUMMARY");
+                    info!("═══════════════════════════════════════════════════════════════");
+                    info!("   Starting Balance:  ${:.2}", starting_bal);
+                    info!("   Current Balance:   ${:.2}", current_bal);
+                    info!("   Total Return:      {:.2}%", total_return);
+                    info!("───────────────────────────────────────────────────────────────");
+                    info!("   Total Fills:       {}", locked.paper_fills);
+                    info!("   Rebates Earned:    ${:.4}", locked.paper_rebates_earned);
+                    info!("   Fees Paid:         ${:.4}", locked.paper_fees_paid);
+                    info!("   Realized P&L:      ${:.2}", locked.paper_realized_pnl);
+                    info!("───────────────────────────────────────────────────────────────");
+                    info!("   Open Orders:       {}", locked.paper_orders.len());
+                    info!("   Tracked Positions: {}", locked.exposure.len());
+                    if removed_paper > 0 {
+                        info!("   Stale Orders Removed: {}", removed_paper);
+                    }
+                    info!("═══════════════════════════════════════════════════════════════");
+                }
+
                 if removed_orders > 0 || removed_exposure > 0 {
                     info!(
                         "Cleanup: removed {} stale orders, {} zero exposures. Current: {} orders, {} exposures",
@@ -779,6 +852,8 @@ fn decimal_from_f64(value: f64, label: &str) -> Result<Decimal, Box<dyn std::err
 // ============================================================================
 
 /// Place a single order and return the order ID if successful
+/// Returns tuple of (order_id, Option<PaperOrder>) - paper order only in paper mode
+#[allow(clippy::too_many_arguments)]
 async fn place_single_order<S: Signer + Sync>(
     client: &SharedClient,
     signer: &S,
@@ -789,15 +864,24 @@ async fn place_single_order<S: Signer + Sync>(
     label: &str,
     paper_trade: bool,
     paper_order_num: u64,
-) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-    // Paper trading mode - log and return fake order ID
+) -> Result<Option<(String, Option<PaperOrder>)>, Box<dyn std::error::Error + Send + Sync>> {
+    // Paper trading mode - log and return fake order ID with order details
     if paper_trade {
         let order_id = format!("PAPER-{:06}", paper_order_num);
         info!(
             "[PAPER] {} order: {} {} @ {} (id: {})",
             label, size, token, price, order_id
         );
-        return Ok(Some(order_id));
+        let paper_order = PaperOrder {
+            id: order_id.clone(),
+            token_id: token.to_string(),
+            side,
+            price,
+            size,
+            filled: Decimal::ZERO,
+            created_at: systemtime_now_secs(),
+        };
+        return Ok(Some((order_id, Some(paper_order))));
     }
 
     // Real trading mode
@@ -814,7 +898,7 @@ async fn place_single_order<S: Signer + Sync>(
     let response = client.post_order(signed).await?;
 
     if response.success {
-        Ok(Some(response.order_id))
+        Ok(Some((response.order_id, None))) // None for paper_order in real mode
     } else {
         warn!("{} failed: {:?}", label, response.error_msg);
         Ok(None)
@@ -962,31 +1046,45 @@ async fn provide_liquidity<S: Signer + Sync>(
 
     let results = futures_util::future::join_all(order_futures).await;
 
-    // Collect successful order IDs
-    let order_ids: Vec<String> = results
-        .into_iter()
-        .filter_map(|result| match result {
-            Ok(Some(id)) => Some(id),
-            Ok(None) => None, // Order failed but not an error
+    // Collect successful orders (both ID and paper order details if applicable)
+    let mut order_ids: Vec<String> = Vec::new();
+    let mut paper_orders_to_add: Vec<PaperOrder> = Vec::new();
+
+    for result in results {
+        match result {
+            Ok(Some((id, paper_order))) => {
+                order_ids.push(id);
+                if let Some(po) = paper_order {
+                    paper_orders_to_add.push(po);
+                }
+            }
+            Ok(None) => {} // Order failed but not an error
             Err(e) => {
                 warn!("Order placement error: {:?}", e);
-                None
             }
-        })
-        .collect();
+        }
+    }
 
     if !order_ids.is_empty() {
         let now = systemtime_now_secs();
         let mut locked = state.write().await;
+
         for id in &order_ids {
             locked.open_orders.insert(id.clone(), now);
         }
 
-        // In paper mode, log summary
+        // Store paper orders for fill simulation
         if config.paper_trade {
+            for po in paper_orders_to_add {
+                locked.paper_orders.insert(po.id.clone(), po);
+            }
             info!(
-                "[PAPER] Placed {} orders. Paper balance: ${}, Total rebates: ${}",
-                order_ids.len(), locked.paper_balance, locked.paper_rebates
+                "[PAPER] Placed {} orders. Balance: ${:.2}, Open orders: {}, Fills: {}, P&L: ${:.2}",
+                order_ids.len(),
+                locked.paper_balance,
+                locked.paper_orders.len(),
+                locked.paper_fills,
+                locked.paper_realized_pnl
             );
         }
     }
@@ -1108,6 +1206,11 @@ fn process_trade_sync(
     trade: &TradeMessage,
     config: &Config,
 ) -> Option<(String, Decimal)> {
+    // In paper mode, simulate fills for our open orders
+    if config.paper_trade {
+        simulate_paper_fills(state, trade, config);
+    }
+
     let delta = if trade.side == Side::Buy {
         trade.size
     } else {
@@ -1145,6 +1248,134 @@ fn process_trade_sync(
     } else {
         None
     }
+}
+
+/// Simulate paper order fills based on market trades
+fn simulate_paper_fills(state: &mut BotState, trade: &TradeMessage, _config: &Config) {
+    // Find paper orders for this token that would be filled by this trade
+    // - Our BUY orders fill when someone SELLS at or below our price
+    // - Our SELL orders fill when someone BUYS at or above our price
+    let trade_price = trade.price;
+    let mut trade_remaining = trade.size;
+
+    // Collect orders to process (can't modify while iterating)
+    let matching_orders: Vec<String> = state
+        .paper_orders
+        .iter()
+        .filter(|(_, order)| {
+            order.token_id == trade.asset_id && order.filled < order.size && {
+                match (&order.side, &trade.side) {
+                    // Our BUY fills when market SELLS at or below our price
+                    (Side::Buy, Side::Sell) => trade_price <= order.price,
+                    // Our SELL fills when market BUYS at or above our price
+                    (Side::Sell, Side::Buy) => trade_price >= order.price,
+                    _ => false, // Same side doesn't fill us
+                }
+            }
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+
+    // Process fills
+    for order_id in matching_orders {
+        if trade_remaining <= Decimal::ZERO {
+            break;
+        }
+
+        if let Some(order) = state.paper_orders.get_mut(&order_id) {
+            let unfilled = order.size - order.filled;
+            let fill_size = unfilled.min(trade_remaining);
+
+            if fill_size <= Decimal::ZERO {
+                continue;
+            }
+
+            // Calculate slippage based on fill size relative to available liquidity
+            // Larger fills relative to trade size = more slippage
+            let fill_ratio = fill_size / (trade.size + Decimal::ONE); // +1 to avoid div by zero
+            let slippage = MAX_SLIPPAGE * fill_ratio;
+
+            // Apply slippage (worse for us: higher buy price, lower sell price)
+            let fill_price = match order.side {
+                Side::Buy => order.price * (Decimal::ONE + slippage),
+                Side::Sell => order.price * (Decimal::ONE - slippage),
+                _ => order.price, // Fallback for any future Side variants
+            };
+
+            // Calculate trade value
+            let fill_value = fill_size * fill_price;
+
+            // Maker rebate (we're makers since our orders were resting)
+            let rebate = fill_value * MAKER_REBATE_RATE;
+            state.paper_rebates_earned += rebate;
+
+            // Update balance based on side
+            match order.side {
+                Side::Buy => {
+                    // We buy: spend USDC, get tokens
+                    state.paper_balance -= fill_value;
+                    state.paper_balance += rebate; // Rebate offsets cost
+
+                    // Track entry price for P&L (weighted average)
+                    let entry = state
+                        .paper_entry_prices
+                        .entry(order.token_id.clone())
+                        .or_insert(Decimal::ZERO);
+                    if *entry == Decimal::ZERO {
+                        *entry = fill_price;
+                    } else {
+                        // Weighted average entry
+                        let existing_pos = state
+                            .exposure
+                            .get(&order.token_id)
+                            .copied()
+                            .unwrap_or(Decimal::ZERO)
+                            .abs();
+                        if existing_pos + fill_size > Decimal::ZERO {
+                            *entry = (*entry * existing_pos + fill_price * fill_size)
+                                / (existing_pos + fill_size);
+                        }
+                    }
+                }
+                Side::Sell => {
+                    // We sell: get USDC, lose tokens
+                    state.paper_balance += fill_value;
+                    state.paper_balance += rebate; // Rebate adds to proceeds
+
+                    // Calculate realized P&L if we had an entry price
+                    if let Some(entry_price) = state.paper_entry_prices.get(&order.token_id) {
+                        let pnl = (fill_price - *entry_price) * fill_size;
+                        state.paper_realized_pnl += pnl;
+                    }
+                }
+                _ => {} // Ignore any future Side variants
+            }
+
+            // Update fill tracking
+            order.filled += fill_size;
+            trade_remaining -= fill_size;
+            state.paper_fills += 1;
+
+            info!(
+                "[PAPER] FILL: {} {} @ {:.4} (slippage: {:.4}%) | Value: ${:.2} | Rebate: ${:.4}",
+                if order.side == Side::Buy { "BUY" } else { "SELL" },
+                fill_size,
+                fill_price,
+                slippage * Decimal::from(100),
+                fill_value,
+                rebate
+            );
+            info!(
+                "[PAPER] Balance: ${:.2} | Realized P&L: ${:.2} | Total fills: {}",
+                state.paper_balance, state.paper_realized_pnl, state.paper_fills
+            );
+        }
+    }
+
+    // Clean up fully filled orders
+    state
+        .paper_orders
+        .retain(|_, order| order.filled < order.size);
 }
 
 // ============================================================================
