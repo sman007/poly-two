@@ -1244,22 +1244,16 @@ async fn provide_liquidity<S: Signer + Sync>(
     no_token: &str,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Track API latency
+    // Track API latency - fetch both orderbooks in parallel
     let start = Instant::now();
-    let book_yes = client
-        .order_book(
-            &OrderBookSummaryRequest::builder()
-                .token_id(yes_token)
-                .build(),
-        )
-        .await?;
-    let book_no = client
-        .order_book(
-            &OrderBookSummaryRequest::builder()
-                .token_id(no_token)
-                .build(),
-        )
-        .await?;
+    let req_yes = OrderBookSummaryRequest::builder().token_id(yes_token).build();
+    let req_no = OrderBookSummaryRequest::builder().token_id(no_token).build();
+    let (book_yes_result, book_no_result) = tokio::join!(
+        client.order_book(&req_yes),
+        client.order_book(&req_no)
+    );
+    let book_yes = book_yes_result?;
+    let book_no = book_no_result?;
     let latency_ms = start.elapsed().as_millis() as u64;
 
     // Update latency in state
