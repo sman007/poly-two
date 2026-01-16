@@ -70,7 +70,20 @@ const MARKET_REFRESH_SECS: u64 = 60;
 // GAMMA API TYPES (for market discovery)
 // ============================================================================
 
-/// Market data from Gamma API
+/// Event from Gamma API (contains nested markets)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GammaEvent {
+    title: String,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    closed: bool,
+    #[serde(default)]
+    markets: Vec<GammaMarket>,
+}
+
+/// Market nested within an event
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GammaMarket {
@@ -111,9 +124,9 @@ fn is_15min_crypto_market(question: &str) -> bool {
     has_time && has_direction
 }
 
-/// Fetch 15-minute crypto markets from Gamma API
+/// Fetch 15-minute crypto markets from Gamma API events endpoint
 async fn discover_15min_markets(http_client: &HttpClient) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{}/markets?closed=false&limit=500", GAMMA_API);
+    let url = format!("{}/events?active=true&closed=false&limit=500", GAMMA_API);
 
     let response = http_client
         .get(&url)
@@ -125,27 +138,36 @@ async fn discover_15min_markets(http_client: &HttpClient) -> Result<Vec<(String,
         return Err(format!("Gamma API returned {}", response.status()).into());
     }
 
-    let markets: Vec<GammaMarket> = response.json().await?;
+    let events: Vec<GammaEvent> = response.json().await?;
+    debug!("Fetched {} events from Gamma API", events.len());
 
     let mut pairs = Vec::new();
 
-    for market in markets {
-        if !market.active || market.closed {
+    for event in events {
+        if !event.active || event.closed {
             continue;
         }
 
-        if !is_15min_crypto_market(&market.question) {
-            continue;
-        }
+        // Check nested markets within each event
+        for market in &event.markets {
+            if !market.active || market.closed {
+                continue;
+            }
 
-        // Parse token IDs from clobTokenIds field (JSON array as string)
-        if let Some(tokens_str) = &market.clob_token_ids {
-            // Format: "[\"token1\", \"token2\"]"
-            let tokens: Result<Vec<String>, _> = serde_json::from_str(tokens_str);
-            if let Ok(tokens) = tokens {
-                if tokens.len() == 2 {
-                    info!("Found 15-min market: {} (vol: ${:.0})", market.question, market.volume24hr);
-                    pairs.push((tokens[0].clone(), tokens[1].clone()));
+            if !is_15min_crypto_market(&market.question) {
+                continue;
+            }
+
+            // Parse token IDs from clobTokenIds field (JSON array as string)
+            if let Some(tokens_str) = &market.clob_token_ids {
+                // Format: "[\"token1\", \"token2\"]"
+                let tokens: Result<Vec<String>, _> = serde_json::from_str(tokens_str);
+                if let Ok(tokens) = tokens {
+                    if tokens.len() == 2 {
+                        info!("Found 15-min market: {} (event: {}, vol: ${:.0})",
+                              market.question, event.title, market.volume24hr);
+                        pairs.push((tokens[0].clone(), tokens[1].clone()));
+                    }
                 }
             }
         }
