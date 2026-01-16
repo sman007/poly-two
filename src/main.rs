@@ -9,7 +9,7 @@ use axum::{extract::State, response::Html, routing::get, Json, Router};
 use chrono::Utc;
 use dotenv::dotenv;
 use futures_util::StreamExt;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::{Credentials, LocalSigner, Signer};
@@ -22,8 +22,9 @@ use polymarket_client_sdk::clob::ws::{Client as WsClient, TradeMessage};
 use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk::types::{Address, Decimal};
 use polymarket_client_sdk::POLYGON;
+use reqwest::Client as HttpClient;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -59,6 +60,106 @@ const FALLBACK_TIMESTAMP: u64 = 1704067200;
 /// Dashboard web server port
 const DASHBOARD_PORT: u16 = 8082;
 
+/// Gamma API base URL for market discovery
+const GAMMA_API: &str = "https://gamma-api.polymarket.com";
+
+/// Market refresh interval (how often to scan for new 15-min markets)
+const MARKET_REFRESH_SECS: u64 = 60;
+
+// ============================================================================
+// GAMMA API TYPES (for market discovery)
+// ============================================================================
+
+/// Market data from Gamma API
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GammaMarket {
+    question: String,
+    #[serde(default)]
+    clob_token_ids: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    closed: bool,
+    #[serde(default)]
+    volume24hr: f64,
+}
+
+/// Check if a market is a 15-minute crypto UP/DOWN market
+fn is_15min_crypto_market(question: &str) -> bool {
+    let q = question.to_lowercase();
+
+    // Must contain crypto keywords
+    let has_crypto = q.contains("bitcoin") || q.contains("btc")
+        || q.contains("ethereum") || q.contains("eth")
+        || q.contains("solana") || q.contains("sol");
+
+    if !has_crypto {
+        return false;
+    }
+
+    // Must have time component (15-minute markets have times like 8:30PM)
+    let has_time = q.contains("pm") || q.contains("am")
+        || q.contains(":00") || q.contains(":15") || q.contains(":30") || q.contains(":45")
+        || (q.contains("15") && (q.contains("minute") || q.contains("min")));
+
+    // Must have direction component
+    let has_direction = q.contains("up") || q.contains("down")
+        || q.contains("above") || q.contains("below")
+        || q.contains("reach") || q.contains("hit");
+
+    has_time && has_direction
+}
+
+/// Fetch 15-minute crypto markets from Gamma API
+async fn discover_15min_markets(http_client: &HttpClient) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+    let url = format!("{}/markets?closed=false&limit=500", GAMMA_API);
+
+    let response = http_client
+        .get(&url)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(format!("Gamma API returned {}", response.status()).into());
+    }
+
+    let markets: Vec<GammaMarket> = response.json().await?;
+
+    let mut pairs = Vec::new();
+
+    for market in markets {
+        if !market.active || market.closed {
+            continue;
+        }
+
+        if !is_15min_crypto_market(&market.question) {
+            continue;
+        }
+
+        // Parse token IDs from clobTokenIds field (JSON array as string)
+        if let Some(tokens_str) = &market.clob_token_ids {
+            // Format: "[\"token1\", \"token2\"]"
+            let tokens: Result<Vec<String>, _> = serde_json::from_str(tokens_str);
+            if let Ok(tokens) = tokens {
+                if tokens.len() == 2 {
+                    info!("Found 15-min market: {} (vol: ${:.0})", market.question, market.volume24hr);
+                    pairs.push((tokens[0].clone(), tokens[1].clone()));
+                }
+            }
+        }
+    }
+
+    if pairs.is_empty() {
+        debug!("No 15-minute crypto markets currently available");
+    } else {
+        info!("Discovered {} 15-minute crypto market(s)", pairs.len());
+    }
+
+    Ok(pairs)
+}
+
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
@@ -70,7 +171,8 @@ struct Config {
     min_balance: Decimal,
     offset: Decimal,
     max_spread: Decimal,
-    market_pairs: Vec<(String, String)>,
+    /// Manual markets (optional, fallback if auto-discovery finds nothing)
+    manual_market_pairs: Vec<(String, String)>,
 
     // Timing configuration
     stale_order_timeout_secs: u64,
@@ -144,6 +246,9 @@ struct BotState {
     loop_count: u64,
     orders_placed: u64,
     last_error: Option<String>,
+    // Dynamic market discovery
+    active_markets: Vec<(String, String)>,
+    last_market_refresh: u64,
 }
 
 /// Record of a paper fill for dashboard display
@@ -189,7 +294,6 @@ struct AppState {
     bot_state: Arc<RwLock<BotState>>,
     config: Config,
     start_time: Instant,
-    market_count: usize,
 }
 
 /// WebSocket context for listener tasks
@@ -243,7 +347,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let start_time = Instant::now();
-    let market_count = config.market_pairs.len();
+
+    // Create HTTP client for market discovery
+    let http_client = HttpClient::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    // Initial market discovery
+    info!("Discovering 15-minute crypto markets...");
+    let initial_markets = match discover_15min_markets(&http_client).await {
+        Ok(markets) if !markets.is_empty() => markets,
+        Ok(_) => {
+            if config.manual_market_pairs.is_empty() {
+                warn!("No 15-minute crypto markets found and no manual markets configured");
+                warn!("Bot will keep scanning for markets every {} seconds", MARKET_REFRESH_SECS);
+            }
+            config.manual_market_pairs.clone()
+        }
+        Err(e) => {
+            warn!("Market discovery failed: {}. Using manual markets.", e);
+            config.manual_market_pairs.clone()
+        }
+    };
+
     let state = Arc::new(RwLock::new(BotState {
         balance: if config.paper_trade { config.paper_starting_balance } else { Decimal::ZERO },
         exposure: HashMap::new(),
@@ -262,6 +388,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop_count: 0,
         orders_placed: 0,
         last_error: None,
+        active_markets: initial_markets,
+        last_market_refresh: systemtime_now_secs(),
     }));
 
     if config.paper_trade {
@@ -274,14 +402,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("══════════════════════════════════════════════════════════════");
     }
 
-    let tokens: Vec<String> = config
-        .market_pairs
-        .iter()
-        .flat_map(|(yes, no)| vec![yes.clone(), no.clone()])
-        .collect();
+    // Get initial token IDs for WebSocket subscription
+    let tokens: Vec<String> = {
+        let locked = state.read().await;
+        locked.active_markets
+            .iter()
+            .flat_map(|(yes, no): &(String, String)| vec![yes.clone(), no.clone()])
+            .collect()
+    };
 
-    let markets = fetch_market_ids(&client, &tokens, &config).await?;
-    info!("Fetched {} market IDs", markets.len());
+    let markets = if !tokens.is_empty() {
+        match fetch_market_ids(&client, &tokens, &config).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("Failed to fetch market IDs: {}. WS will connect without subscriptions.", e);
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    info!("WebSocket subscribing to {} market IDs", markets.len());
 
     // Spawn WebSocket listener with reconnection
     let ws_ctx = WsContext {
@@ -308,12 +449,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         periodic_cleanup(cleanup_state, cleanup_shutdown, cleanup_config).await;
     });
 
+    // Spawn periodic market refresh task
+    let refresh_state = state.clone();
+    let refresh_shutdown = shutdown_token.clone();
+    let refresh_config = config.clone();
+    let refresh_http = http_client.clone();
+
+    tokio::spawn(async move {
+        periodic_market_refresh(refresh_state, refresh_shutdown, refresh_config, refresh_http).await;
+    });
+
     // Spawn dashboard web server
     let app_state = AppState {
         bot_state: state.clone(),
         config: config.clone(),
         start_time,
-        market_count,
     };
     tokio::spawn(async move {
         run_dashboard_server(app_state).await;
@@ -402,7 +552,19 @@ async fn run_main_loop_iteration<S: Signer + Sync>(
         warn!("Stale order cancel failed: {:?}", e);
     }
 
-    for (yes_token, no_token) in &config.market_pairs {
+    // Get current active markets from state
+    let market_pairs: Vec<(String, String)> = {
+        let locked = state.read().await;
+        locked.active_markets.clone()
+    };
+
+    if market_pairs.is_empty() {
+        debug!("No active markets to trade - waiting for market discovery");
+        sleep(Duration::from_millis(config.main_loop_interval_ms)).await;
+        return;
+    }
+
+    for (yes_token, no_token) in &market_pairs {
         if let Err(e) = retry(
             || provide_liquidity(state, client, signer.as_ref(), yes_token, no_token, config),
             config,
@@ -668,6 +830,61 @@ async fn periodic_cleanup(
     }
 }
 
+/// Periodically refresh market discovery to find new 15-min crypto markets
+async fn periodic_market_refresh(
+    state: Arc<RwLock<BotState>>,
+    shutdown: CancellationToken,
+    config: Config,
+    http_client: HttpClient,
+) {
+    let refresh_interval = Duration::from_secs(MARKET_REFRESH_SECS);
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("Market refresh task shutting down...");
+                break;
+            }
+            _ = sleep(refresh_interval) => {
+                debug!("Refreshing 15-minute crypto markets...");
+
+                match discover_15min_markets(&http_client).await {
+                    Ok(markets) if !markets.is_empty() => {
+                        let mut locked = state.write().await;
+                        let old_count = locked.active_markets.len();
+                        locked.active_markets = markets;
+                        locked.last_market_refresh = systemtime_now_secs();
+
+                        if locked.active_markets.len() != old_count {
+                            info!(
+                                "Market refresh: {} -> {} active 15-min markets",
+                                old_count, locked.active_markets.len()
+                            );
+                        }
+                    }
+                    Ok(_) => {
+                        // No markets found, fall back to manual if available
+                        if !config.manual_market_pairs.is_empty() {
+                            let mut locked = state.write().await;
+                            if locked.active_markets.is_empty() {
+                                locked.active_markets = config.manual_market_pairs.clone();
+                                info!("No 15-min markets found, using {} manual markets", locked.active_markets.len());
+                            }
+                        } else {
+                            debug!("No 15-minute crypto markets available");
+                        }
+                    }
+                    Err(e) => {
+                        let mut locked = state.write().await;
+                        locked.last_error = Some(format!("Market discovery: {}", e));
+                        warn!("Market refresh failed: {}", e);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ============================================================================
 // CONFIGURATION LOADING
 // ============================================================================
@@ -680,23 +897,29 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     let offset = parse_decimal_env("OFFSET", "0.001")?;
     let max_spread = parse_decimal_env("MAX_SPREAD", "0.01")?;
 
-    let markets_str = env::var("MARKETS").map_err(|_| "Missing MARKETS")?;
-
-    let market_pairs: Vec<(String, String)> = markets_str
-        .split(';')
-        .filter_map(|pair| {
-            let parts: Vec<&str> = pair.split(',').collect();
-            if parts.len() == 2 && !parts[0].trim().is_empty() && !parts[1].trim().is_empty() {
-                Some((parts[0].trim().to_string(), parts[1].trim().to_string()))
-            } else {
-                warn!("Skipping invalid market pair: {}", pair);
-                None
-            }
+    // MARKETS is now optional - bot will auto-discover 15-min crypto markets
+    let manual_market_pairs: Vec<(String, String)> = env::var("MARKETS")
+        .ok()
+        .map(|markets_str| {
+            markets_str
+                .split(';')
+                .filter_map(|pair| {
+                    let parts: Vec<&str> = pair.split(',').collect();
+                    if parts.len() == 2 && !parts[0].trim().is_empty() && !parts[1].trim().is_empty() {
+                        Some((parts[0].trim().to_string(), parts[1].trim().to_string()))
+                    } else {
+                        warn!("Skipping invalid market pair: {}", pair);
+                        None
+                    }
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
 
-    if market_pairs.is_empty() {
-        return Err("No valid markets configured".into());
+    if !manual_market_pairs.is_empty() {
+        info!("Manual markets configured: {}", manual_market_pairs.len());
+    } else {
+        info!("No manual markets - will auto-discover 15-minute crypto markets");
     }
 
     // Timing configuration with validation
@@ -795,7 +1018,7 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
         min_balance,
         offset,
         max_spread,
-        market_pairs,
+        manual_market_pairs,
         stale_order_timeout_secs,
         main_loop_interval_ms,
         rehedge_threshold_pct,
@@ -1718,7 +1941,7 @@ async fn api_handler(State(app_state): State<AppState>) -> Json<DashboardData> {
         tracked_positions: locked.exposure.len(),
         recent_fills: locked.recent_fills.iter().rev().take(20).cloned().collect(),
         timestamp: Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-        market_count: app_state.market_count,
+        market_count: locked.active_markets.len(),
         api_latency_ms: locked.api_latency_ms,
         ws_connected: locked.ws_connected,
         loop_count: locked.loop_count,

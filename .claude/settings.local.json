@@ -12,7 +12,11 @@
       "Bash(git push)",
       "Bash(cargo build:*)",
       "WebSearch",
-      "WebFetch(domain:gamma-api.polymarket.com)"
+      "WebFetch(domain:gamma-api.polymarket.com)",
+      "WebFetch(domain:95.179.138.245)",
+      "Bash(curl -s http://95.179.138.245:8082/)",
+      "Bash(curl -s http://95.179.138.245:8082/api/data)",
+      "Bash(curl:*)"
     ],
     "deny": [],
     "ask": []
