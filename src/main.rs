@@ -1013,7 +1013,8 @@ async fn periodic_cleanup(
                     const RESOLUTION_TIME_SECS: u64 = 15 * 60; // 15 minutes
 
                     // Collect resolutions first to avoid borrow conflicts
-                    let resolutions: Vec<(String, Decimal, Decimal, Decimal)> = locked
+                    // Tuple: (id, filled, payout, profit, profit_per_share, yes_token, no_token)
+                    let resolutions: Vec<(String, Decimal, Decimal, Decimal, Decimal, String, String)> = locked
                         .arb_positions
                         .iter()
                         .filter(|(_, arb)| {
@@ -1021,33 +1022,44 @@ async fn periodic_cleanup(
                                 && now.saturating_sub(arb.created_at) >= RESOLUTION_TIME_SECS
                         })
                         .map(|(id, arb)| {
-                            let filled = arb.yes_filled.min(arb.no_filled);
+                            // Paper mode: assume full fill at target_size
+                            // (In live mode, this would use actual yes_filled.min(no_filled))
+                            let filled = arb.target_size;
                             let payout = filled * Decimal::ONE;
                             let profit_per_share = Decimal::ONE - arb.cost_per_share;
                             let profit = filled * profit_per_share;
-                            (id.clone(), payout, profit, profit_per_share)
+                            (id.clone(), filled, payout, profit, profit_per_share, arb.yes_token.clone(), arb.no_token.clone())
                         })
                         .collect();
 
-                    // Apply resolutions
+                    // Apply resolutions (two passes to avoid borrow conflicts)
                     let mut total_payout = Decimal::ZERO;
                     let mut total_profit = Decimal::ZERO;
-                    for (id, payout, profit, profit_per_share) in &resolutions {
+
+                    // First pass: update arb positions
+                    for (id, _filled, payout, profit, _profit_per_share, _yes_token, _no_token) in &resolutions {
                         if let Some(arb) = locked.arb_positions.get_mut(id) {
-                            let filled = arb.yes_filled.min(arb.no_filled);
                             arb.resolved = true;
                             arb.resolved_pnl = *profit;
                             total_payout += payout;
                             total_profit += profit;
-                            info!(
-                                "[PAPER] ARB RESOLVED: {} | Filled: {:.2} | Payout: ${:.2} | Profit: ${:.2} ({:.2}%)",
-                                arb.id,
-                                filled,
-                                payout,
-                                profit,
-                                profit_per_share * Decimal::from(100)
-                            );
                         }
+                    }
+
+                    // Second pass: clear exposure and log (separate borrow scope)
+                    for (id, filled, payout, profit, profit_per_share, yes_token, no_token) in &resolutions {
+                        // CRITICAL: Clear exposure for both tokens to free up capital
+                        locked.exposure.remove(yes_token);
+                        locked.exposure.remove(no_token);
+
+                        info!(
+                            "[PAPER] ARB RESOLVED: {} | Size: {:.2} | Payout: ${:.2} | Profit: ${:.2} ({:.2}%) | Exposure cleared",
+                            id,
+                            filled,
+                            payout,
+                            profit,
+                            profit_per_share * Decimal::from(100)
+                        );
                     }
 
                     if !resolutions.is_empty() {
@@ -1217,7 +1229,7 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
         return Err("REHEDGE_THRESHOLD_PCT must be between 0 and 1".into());
     }
 
-    let max_exposure_pct = parse_f64_env("MAX_EXPOSURE_PCT", "0.3")?;
+    let max_exposure_pct = parse_f64_env("MAX_EXPOSURE_PCT", "0.7")?; // 70% - arb positions are risk-free
     if !(0.0..=1.0).contains(&max_exposure_pct) {
         return Err("MAX_EXPOSURE_PCT must be between 0 and 1".into());
     }
@@ -1609,12 +1621,18 @@ async fn find_arb_opportunity<S: Signer + Sync>(
 
     // Position sizing: Kelly criterion (Reference Wallet style)
     // Kelly formula: size = (edge / variance) * kelly_fraction * balance
-    // With defaults (edge=0.03, variance=0.01, kelly=0.2): 60% of balance per trade
-    let kelly_multiplier = (config.edge / config.variance) * config.kelly_fraction;
-    let kelly_size = Decimal::from_f64(kelly_multiplier).unwrap_or(ARB_SIZE_PCT) * balance;
+    // Use ACTUAL arb spread as edge (not config.edge) for dynamic sizing
+    let actual_edge = Decimal::ONE - price_sum; // e.g., 1.0 - 0.98 = 0.02 (2% spread)
+    let variance =
+        Decimal::from_f64(config.variance).unwrap_or(Decimal::from_parts(1, 0, 0, false, 2));
+    let kelly_frac =
+        Decimal::from_f64(config.kelly_fraction).unwrap_or(Decimal::from_parts(2, 0, 0, false, 1));
+    let kelly_size = (actual_edge / variance) * kelly_frac * balance;
 
-    // Cap position size by exposure limit (max 30% of balance in arb positions)
-    let max_arb_exposure = balance * Decimal::from_parts(30, 0, 0, false, 2); // 30%
+    // Cap position size by exposure limit (use config.max_exposure_pct, default 70% for risk-free arbs)
+    let max_exposure_decimal = Decimal::from_f64(config.max_exposure_pct)
+        .unwrap_or(Decimal::from_parts(7, 0, 0, false, 1));
+    let max_arb_exposure = balance * max_exposure_decimal;
     let remaining_headroom = max_arb_exposure.saturating_sub(total_arb_exposure);
     // exposure = size * price_sum * 2 (both sides), so max_size = headroom / (price_sum * 2)
     let max_size_from_exposure = remaining_headroom / (price_sum * Decimal::from(2));
@@ -1718,12 +1736,77 @@ async fn find_arb_opportunity<S: Signer + Sync>(
         }
         locked.orders_placed += 2;
 
-        // Store paper orders for fill simulation
-        if config.paper_trade {
+        // Paper mode: simulate IMMEDIATE fills for arb orders
+        // Reference Wallet assumes fills happen instantly at bid price (liquidity is there)
+        // We deduct cost and mark position as filled, then wait for 15-min resolution
+        let (yes_filled, no_filled) = if config.paper_trade {
+            // Calculate total cost: (YES_price + NO_price) * size
+            let total_cost = price_sum * size;
+
+            // Deduct from paper balance
+            locked.paper_balance -= total_cost;
+
+            // Add rebates for both fills
+            let rebate = total_cost * config.rebate_rate;
+            locked.paper_balance += rebate;
+            locked.paper_rebates_earned += rebate;
+
+            // Track exposure for both tokens
+            *locked
+                .exposure
+                .entry(yes_token.to_string())
+                .or_insert(Decimal::ZERO) += size;
+            *locked
+                .exposure
+                .entry(no_token.to_string())
+                .or_insert(Decimal::ZERO) += size;
+
+            // Track entry prices
+            locked
+                .paper_entry_prices
+                .insert(yes_token.to_string(), best_bid_yes);
+            locked
+                .paper_entry_prices
+                .insert(no_token.to_string(), best_bid_no);
+
+            // Count fills
+            locked.paper_fills += 2;
+
+            // Record fills for dashboard
+            let fill_record_yes = FillRecord {
+                time: chrono::Utc::now().format("%H:%M:%S").to_string(),
+                side: "BUY".to_string(),
+                size: format!("{:.2}", size),
+                price: format!("{:.4}", best_bid_yes),
+                value: format!("${:.2}", best_bid_yes * size),
+                rebate: format!("${:.4}", rebate / Decimal::from(2)),
+                pnl: "-".to_string(),
+            };
+            let fill_record_no = FillRecord {
+                time: chrono::Utc::now().format("%H:%M:%S").to_string(),
+                side: "BUY".to_string(),
+                size: format!("{:.2}", size),
+                price: format!("{:.4}", best_bid_no),
+                value: format!("${:.2}", best_bid_no * size),
+                rebate: format!("${:.4}", rebate / Decimal::from(2)),
+                pnl: "-".to_string(),
+            };
+            locked.recent_fills.push(fill_record_yes);
+            locked.recent_fills.push(fill_record_no);
+
+            info!(
+                "[PAPER] INSTANT FILL: BUY {} YES @ {:.4} + {} NO @ {:.4} = ${:.2} total cost",
+                size, best_bid_yes, size, best_bid_no, total_cost
+            );
+
+            (size, size) // Both sides fully filled
+        } else {
+            // Live mode: store paper orders for fill simulation
             for po in paper_orders_to_add {
                 locked.paper_orders.insert(po.id.clone(), po);
             }
-        }
+            (Decimal::ZERO, Decimal::ZERO)
+        };
 
         // Create and track arb position
         let arb_position = ArbPosition {
@@ -1732,8 +1815,8 @@ async fn find_arb_opportunity<S: Signer + Sync>(
             no_token: no_token.to_string(),
             target_size: size,
             cost_per_share: price_sum,
-            yes_filled: Decimal::ZERO,
-            no_filled: Decimal::ZERO,
+            yes_filled,
+            no_filled,
             yes_price: best_bid_yes,
             no_price: best_bid_no,
             created_at: now,
