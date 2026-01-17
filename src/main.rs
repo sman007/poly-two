@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use axum::{extract::State, response::Html, routing::get, Json, Router};
 use chrono::Utc;
 use dotenv::dotenv;
-use futures_util::StreamExt;
+use futures_util::{future::join_all, StreamExt};
 use log::{debug, error, info, warn};
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::auth::Normal;
@@ -762,15 +762,32 @@ async fn run_main_loop_iteration<S: Signer + Sync>(
         return;
     }
 
-    for (yes_token, no_token) in &market_pairs {
-        if let Err(e) = retry(
-            || find_arb_opportunity(state, client, signer.as_ref(), yes_token, no_token, config),
-            config,
-        )
-        .await
-        {
+    // Parallel orderbook fetches - process all markets simultaneously
+    // This reduces latency from O(n * 50ms) to O(50ms) for n markets
+    let futures: Vec<_> = market_pairs
+        .iter()
+        .map(|(yes_token, no_token)| {
+            let state = Arc::clone(state);
+            let client = Arc::clone(client);
+            let signer = Arc::clone(signer);
+            let config = config.clone();
+            let yes = yes_token.clone();
+            let no = no_token.clone();
+            async move {
+                let result = retry(
+                    || find_arb_opportunity(&state, &client, signer.as_ref(), &yes, &no, &config),
+                    &config,
+                )
+                .await;
+                (yes, result)
+            }
+        })
+        .collect();
+
+    let results = join_all(futures).await;
+    for (yes_token, result) in results {
+        if let Err(e) = result {
             warn!("Arb search failed for {}: {:?}", yes_token, e);
-            // Continue to next market pair - no extra sleep (retry already handles backoff)
         }
     }
 

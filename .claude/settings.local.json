@@ -26,7 +26,16 @@
       "Bash(python3:*)",
       "WebFetch(domain:polygonscan.com)",
       "WebFetch(domain:data-api.polymarket.com)",
-      "WebFetch(domain:clob.polymarket.com)"
+      "WebFetch(domain:clob.polymarket.com)",
+      "WebFetch(domain:docs.polymarket.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(cargo run:*)",
+      "Bash(RUST_LOG=info cargo run:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo search:*)",
+      "Bash(cargo update:*)",
+      "Bash(grep:*)",
+      "Bash(cargo doc:*)"
     ],
     "deny": [],
     "ask": []
