@@ -16,7 +16,17 @@
       "WebFetch(domain:95.179.138.245)",
       "Bash(curl -s http://95.179.138.245:8082/)",
       "Bash(curl -s http://95.179.138.245:8082/api/data)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "WebFetch(domain:polymarket.com)",
+      "Bash(for ts in 1768585500 1768586400 1768587300 1768588200)",
+      "Bash(do)",
+      "Bash(echo:*)",
+      "Bash(done)",
+      "Bash(scp:*)",
+      "Bash(python3:*)",
+      "WebFetch(domain:polygonscan.com)",
+      "WebFetch(domain:data-api.polymarket.com)",
+      "WebFetch(domain:clob.polymarket.com)"
     ],
     "deny": [],
     "ask": []

@@ -60,6 +60,25 @@ const FALLBACK_TIMESTAMP: u64 = 1704067200;
 /// Dashboard web server port
 const DASHBOARD_PORT: u16 = 8082;
 
+// ============================================================================
+// ARBITRAGE CONSTANTS (Reference Wallet Strategy)
+// ============================================================================
+
+/// Arb threshold for maker execution: trigger when YES_ask + NO_ask < 0.99
+const ARB_THRESHOLD_MAKER: Decimal = Decimal::from_parts(99, 0, 0, false, 2);
+
+/// Arb threshold for taker fallback: trigger when sum < 0.98 (covers 1% taker fees)
+const ARB_THRESHOLD_TAKER: Decimal = Decimal::from_parts(98, 0, 0, false, 2);
+
+/// Size per arb trade as fraction of balance (0.2% = 0.002)
+const ARB_SIZE_PCT: Decimal = Decimal::from_parts(2, 0, 0, false, 3);
+
+/// Maximum size per side of arb trade ($5000)
+const MAX_ARB_SIZE: Decimal = Decimal::from_parts(5000, 0, 0, false, 0);
+
+/// Imbalance threshold for rehedging (5% of balance)
+const IMBALANCE_THRESHOLD_PCT: Decimal = Decimal::from_parts(5, 0, 0, false, 2);
+
 /// Gamma API base URL for market discovery
 const GAMMA_API: &str = "https://gamma-api.polymarket.com";
 
@@ -86,6 +105,7 @@ struct GammaEvent {
 /// Market nested within an event
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct GammaMarket {
     question: String,
     #[serde(default)]
@@ -98,75 +118,101 @@ struct GammaMarket {
     volume24hr: f64,
 }
 
-/// Check if a market is a 15-minute crypto UP/DOWN market
-fn is_15min_crypto_market(question: &str) -> bool {
-    let q = question.to_lowercase();
-
-    // Must contain crypto keywords
-    let has_crypto = q.contains("bitcoin") || q.contains("btc")
-        || q.contains("ethereum") || q.contains("eth")
-        || q.contains("solana") || q.contains("sol");
-
-    if !has_crypto {
-        return false;
-    }
-
-    // Must have time component (15-minute markets have times like 8:30PM)
-    let has_time = q.contains("pm") || q.contains("am")
-        || q.contains(":00") || q.contains(":15") || q.contains(":30") || q.contains(":45")
-        || (q.contains("15") && (q.contains("minute") || q.contains("min")));
-
-    // Must have direction component
-    let has_direction = q.contains("up") || q.contains("down")
-        || q.contains("above") || q.contains("below")
-        || q.contains("reach") || q.contains("hit");
-
-    has_time && has_direction
+/// Trade from the Polymarket data API
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiTrade {
+    asset: String,
+    side: String,
+    size: f64,
+    price: f64,
+    timestamp: u64,
 }
 
-/// Fetch 15-minute crypto markets from Gamma API events endpoint
+/// 15-minute interval in seconds
+const INTERVAL_15M: u64 = 900;
+
+/// Asset prefixes for 15-minute updown markets
+const UPDOWN_ASSETS: [&str; 2] = ["btc", "eth"];
+
+/// Calculate 15-minute window timestamps for discovery
+/// Returns timestamps for current window and next few windows
+fn get_15min_window_timestamps() -> Vec<u64> {
+    let now = systemtime_now_secs();
+    // Round down to nearest 15-minute boundary
+    let current_window = (now / INTERVAL_15M) * INTERVAL_15M;
+
+    // Return current window plus next 3 windows (to catch markets about to start)
+    vec![
+        current_window,
+        current_window + INTERVAL_15M,
+        current_window + INTERVAL_15M * 2,
+        current_window + INTERVAL_15M * 3,
+    ]
+}
+
+/// Fetch 15-minute crypto UP/DOWN markets by querying specific slugs
+/// Format: {asset}-updown-15m-{timestamp} (e.g., btc-updown-15m-1768587300)
 async fn discover_15min_markets(http_client: &HttpClient) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{}/events?active=true&closed=false&limit=500", GAMMA_API);
-
-    let response = http_client
-        .get(&url)
-        .timeout(Duration::from_secs(30))
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        return Err(format!("Gamma API returned {}", response.status()).into());
-    }
-
-    let events: Vec<GammaEvent> = response.json().await?;
-    debug!("Fetched {} events from Gamma API", events.len());
-
+    let timestamps = get_15min_window_timestamps();
     let mut pairs = Vec::new();
+    let mut found_slugs = Vec::new();
 
-    for event in events {
-        if !event.active || event.closed {
-            continue;
-        }
+    // Query each asset + timestamp combination
+    for asset in UPDOWN_ASSETS {
+        for &ts in &timestamps {
+            let slug = format!("{}-updown-15m-{}", asset, ts);
+            let url = format!("{}/events?slug={}", GAMMA_API, slug);
 
-        // Check nested markets within each event
-        for market in &event.markets {
-            if !market.active || market.closed {
+            let response = match http_client
+                .get(&url)
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!("Failed to query {}: {}", slug, e);
+                    continue;
+                }
+            };
+
+            if !response.status().is_success() {
                 continue;
             }
 
-            if !is_15min_crypto_market(&market.question) {
-                continue;
-            }
+            let events: Vec<GammaEvent> = match response.json().await {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
 
-            // Parse token IDs from clobTokenIds field (JSON array as string)
-            if let Some(tokens_str) = &market.clob_token_ids {
-                // Format: "[\"token1\", \"token2\"]"
-                let tokens: Result<Vec<String>, _> = serde_json::from_str(tokens_str);
-                if let Ok(tokens) = tokens {
-                    if tokens.len() == 2 {
-                        info!("Found 15-min market: {} (event: {}, vol: ${:.0})",
-                              market.question, event.title, market.volume24hr);
-                        pairs.push((tokens[0].clone(), tokens[1].clone()));
+            // Process found events
+            for event in events {
+                if !event.active || event.closed {
+                    continue;
+                }
+
+                for market in &event.markets {
+                    if market.closed {
+                        continue;
+                    }
+
+                    // Parse clobTokenIds - may be a JSON string or already an array
+                    if let Some(tokens_str) = &market.clob_token_ids {
+                        let tokens: Result<Vec<String>, _> = serde_json::from_str(tokens_str);
+                        if let Ok(tokens) = tokens {
+                            if tokens.len() == 2 {
+                                // tokens[0] = Up, tokens[1] = Down
+                                pairs.push((tokens[0].clone(), tokens[1].clone()));
+                                found_slugs.push(slug.clone());
+                                info!(
+                                    "Found 15-min market: {} | Up: {}... Down: {}...",
+                                    event.title,
+                                    &tokens[0][..20.min(tokens[0].len())],
+                                    &tokens[1][..20.min(tokens[1].len())]
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -174,9 +220,13 @@ async fn discover_15min_markets(http_client: &HttpClient) -> Result<Vec<(String,
     }
 
     if pairs.is_empty() {
-        debug!("No 15-minute crypto markets currently available");
+        debug!("No active 15-minute UP/DOWN markets found");
     } else {
-        info!("Discovered {} 15-minute crypto market(s)", pairs.len());
+        info!(
+            "Discovered {} 15-minute UP/DOWN market(s): {:?}",
+            pairs.len(),
+            found_slugs
+        );
     }
 
     Ok(pairs)
@@ -246,6 +296,59 @@ struct PaperOrder {
     created_at: u64,
 }
 
+/// Arbitrage position tracking (Reference Wallet Strategy)
+/// Tracks paired YES/NO positions that guarantee profit at resolution
+#[derive(Clone, Debug, Serialize)]
+struct ArbPosition {
+    /// Unique ID for this arb position
+    id: String,
+    /// YES token ID
+    yes_token: String,
+    /// NO token ID
+    no_token: String,
+    /// Target size for each side
+    target_size: Decimal,
+    /// Cost per share (YES price + NO price at entry)
+    cost_per_share: Decimal,
+    /// Amount of YES tokens filled
+    yes_filled: Decimal,
+    /// Amount of NO tokens filled
+    no_filled: Decimal,
+    /// YES entry price
+    yes_price: Decimal,
+    /// NO entry price
+    no_price: Decimal,
+    /// Timestamp when position was opened
+    created_at: u64,
+    /// Whether this position has resolved (market ended)
+    resolved: bool,
+    /// Profit at resolution (if resolved)
+    resolved_pnl: Decimal,
+}
+
+impl ArbPosition {
+    /// Expected profit per share at resolution
+    fn expected_profit_per_share(&self) -> Decimal {
+        Decimal::ONE - self.cost_per_share
+    }
+
+    /// Total expected profit if fully filled
+    fn expected_total_profit(&self) -> Decimal {
+        let filled = self.yes_filled.min(self.no_filled);
+        filled * self.expected_profit_per_share()
+    }
+
+    /// Check if position is balanced (YES and NO fills are equal)
+    fn is_balanced(&self) -> bool {
+        (self.yes_filled - self.no_filled).abs() < Decimal::from_parts(1, 0, 0, false, 2) // 0.01 tolerance
+    }
+
+    /// Get imbalance amount (positive = more YES, negative = more NO)
+    fn imbalance(&self) -> Decimal {
+        self.yes_filled - self.no_filled
+    }
+}
+
 struct BotState {
     balance: Decimal,
     exposure: HashMap<String, Decimal>,
@@ -260,6 +363,8 @@ struct BotState {
     paper_order_count: u64,
     // Track entry prices for P&L calculation
     paper_entry_prices: HashMap<String, Decimal>,
+    // Track last trade prices for unrealized P&L
+    last_trade_prices: HashMap<String, Decimal>,
     // Recent fills for dashboard display
     recent_fills: Vec<FillRecord>,
     // Performance stats
@@ -271,6 +376,13 @@ struct BotState {
     // Dynamic market discovery
     active_markets: Vec<(String, String)>,
     last_market_refresh: u64,
+    // Arbitrage position tracking (Reference Wallet Strategy)
+    arb_positions: HashMap<String, ArbPosition>,
+    arb_position_count: u64,
+    // Stats for arb strategy
+    arb_opportunities_found: u64,
+    arb_positions_resolved: u64,
+    arb_total_profit: Decimal,
 }
 
 /// Record of a paper fill for dashboard display
@@ -285,6 +397,18 @@ struct FillRecord {
     pnl: String,
 }
 
+/// Position data for dashboard display
+#[derive(Debug, Clone, Serialize)]
+struct PositionData {
+    token_id_short: String,
+    size: String,
+    entry_price: String,
+    current_price: String,
+    cost_basis: String,
+    market_value: String,
+    unrealized_pnl: String,
+}
+
 /// Dashboard API response
 #[derive(Serialize)]
 struct DashboardData {
@@ -294,11 +418,14 @@ struct DashboardData {
     current_balance: String,
     total_return_pct: String,
     realized_pnl: String,
+    unrealized_pnl: String,
+    position_cost: String,
     rebates_earned: String,
     fees_paid: String,
     total_fills: u64,
     open_orders: usize,
     tracked_positions: usize,
+    positions: Vec<PositionData>,
     recent_fills: Vec<FillRecord>,
     timestamp: String,
     // New stats
@@ -404,6 +531,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         paper_realized_pnl: Decimal::ZERO,
         paper_order_count: 0,
         paper_entry_prices: HashMap::new(),
+        last_trade_prices: HashMap::new(),
         recent_fills: Vec::new(),
         api_latency_ms: 0,
         ws_connected: false,
@@ -412,15 +540,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         last_error: None,
         active_markets: initial_markets,
         last_market_refresh: systemtime_now_secs(),
+        // Arbitrage position tracking (Reference Wallet Strategy)
+        arb_positions: HashMap::new(),
+        arb_position_count: 0,
+        arb_opportunities_found: 0,
+        arb_positions_resolved: 0,
+        arb_total_profit: Decimal::ZERO,
     }));
 
     if config.paper_trade {
         info!("══════════════════════════════════════════════════════════════");
-        info!("   PAPER TRADING MODE - NO REAL ORDERS WILL BE PLACED");
+        info!("   PAPER TRADING MODE - ARBITRAGE STRATEGY (Reference Wallet)");
+        info!("   Strategy: Buy YES + NO when sum < ${:.2}", ARB_THRESHOLD_MAKER);
         info!("   Starting balance: ${}", config.paper_starting_balance);
-        info!("   Maker rebate: {}%  |  Taker fee: {}%",
-              MAKER_REBATE_RATE * Decimal::from(100),
-              TAKER_FEE_RATE * Decimal::from(100));
+        info!("   Size per trade: {:.1}% of balance (max ${})",
+              ARB_SIZE_PCT * Decimal::from(100), MAX_ARB_SIZE);
+        info!("   Maker rebate: {}%", MAKER_REBATE_RATE * Decimal::from(100));
         info!("══════════════════════════════════════════════════════════════");
     }
 
@@ -490,6 +625,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         run_dashboard_server(app_state).await;
     });
+
+    // Spawn paper trade polling task (polls data API as WebSocket backup)
+    if config.paper_trade {
+        let poll_state = state.clone();
+        let poll_http = http_client.clone();
+        let poll_config = config.clone();
+        let poll_shutdown = shutdown_token.clone();
+        tokio::spawn(async move {
+            poll_trades_for_paper_fills(poll_state, poll_http, poll_config, poll_shutdown).await;
+        });
+        info!("Paper trade polling task spawned (polling data API every 5s)");
+    }
 
     // Main loop with shutdown support
     loop {
@@ -588,12 +735,12 @@ async fn run_main_loop_iteration<S: Signer + Sync>(
 
     for (yes_token, no_token) in &market_pairs {
         if let Err(e) = retry(
-            || provide_liquidity(state, client, signer.as_ref(), yes_token, no_token, config),
+            || find_arb_opportunity(state, client, signer.as_ref(), yes_token, no_token, config),
             config,
         )
         .await
         {
-            warn!("Liquidity provision failed for {}: {:?}", yes_token, e);
+            warn!("Arb search failed for {}: {:?}", yes_token, e);
             // Continue to next market pair - no extra sleep (retry already handles backoff)
         }
     }
@@ -1236,7 +1383,10 @@ async fn place_single_order<S: Signer + Sync>(
     }
 }
 
-async fn provide_liquidity<S: Signer + Sync>(
+/// Find arbitrage opportunity (Reference Wallet Strategy)
+/// Pure arbitrage: buy YES + NO when sum < threshold, hold to resolution
+/// Zero directional risk - always hedged
+async fn find_arb_opportunity<S: Signer + Sync>(
     state: &RwLock<BotState>,
     client: &SharedClient,
     signer: &S,
@@ -1262,116 +1412,86 @@ async fn provide_liquidity<S: Signer + Sync>(
         locked.api_latency_ms = latency_ms;
     }
 
-    let Some((best_bid_yes, best_ask_yes)) = best_bid_ask(&book_yes) else {
-        warn!("Skipping {}: empty orderbook", yes_token);
+    // Get best ASK prices (price to BUY)
+    let Some((_, best_ask_yes)) = best_bid_ask(&book_yes) else {
+        debug!("Skipping {}: empty orderbook", yes_token);
         return Ok(());
     };
 
-    let Some((best_bid_no, best_ask_no)) = best_bid_ask(&book_no) else {
-        warn!("Skipping {}: empty orderbook", no_token);
+    let Some((_, best_ask_no)) = best_bid_ask(&book_no) else {
+        debug!("Skipping {}: empty orderbook", no_token);
         return Ok(());
     };
 
-    let current_spread = best_ask_yes - best_bid_yes;
-    if current_spread > config.max_spread {
-        warn!(
-            "Skipping {}: spread too wide ({})",
-            yes_token, current_spread
+    // CORE ARB LOGIC: Check if YES_ask + NO_ask < threshold
+    // If so, we can buy both for less than $1 and get $1 at resolution
+    let price_sum = best_ask_yes + best_ask_no;
+
+    // Determine if arb opportunity exists
+    let is_maker_arb = price_sum < ARB_THRESHOLD_MAKER; // < 0.99
+    let is_taker_arb = price_sum < ARB_THRESHOLD_TAKER; // < 0.98
+
+    if !is_maker_arb {
+        // No arb opportunity - sum >= 0.99
+        debug!(
+            "No arb: YES_ask={:.4} + NO_ask={:.4} = {:.4} (need < {:.2})",
+            best_ask_yes, best_ask_no, price_sum, ARB_THRESHOLD_MAKER
         );
         return Ok(());
     }
 
-    let (balance, total_exposure, yes_exposure, no_exposure) = {
+    // ARB OPPORTUNITY FOUND!
+    let expected_profit_pct = (Decimal::ONE - price_sum) * Decimal::from(100);
+    info!(
+        "{}ARB FOUND: YES={:.4} + NO={:.4} = {:.4} | Profit: {:.2}%",
+        if config.paper_trade { "[PAPER] " } else { "" },
+        best_ask_yes, best_ask_no, price_sum, expected_profit_pct
+    );
+
+    // Get current balance and calculate position size
+    let (balance, total_arb_exposure) = {
         let locked = state.read().await;
-        let total = locked
-            .exposure
-            .values()
-            .fold(Decimal::ZERO, |acc, val| acc + val.abs());
-        let yes_exp = locked.exposure.get(yes_token).copied().unwrap_or(Decimal::ZERO);
-        let no_exp = locked.exposure.get(no_token).copied().unwrap_or(Decimal::ZERO);
-        (locked.balance, total, yes_exp, no_exp)
+        let arb_exposure: Decimal = locked.arb_positions.values()
+            .filter(|p| !p.resolved)
+            .map(|p| p.target_size * p.cost_per_share * Decimal::from(2)) // Both sides
+            .sum();
+        (locked.balance, arb_exposure)
     };
 
-    let balance_f64 = decimal_to_f64(balance, "balance")?;
-    let total_exposure_f64 = decimal_to_f64(total_exposure, "total_exposure")?;
+    // Position sizing: 0.2% of balance per side, capped at $5k
+    let size_from_pct = balance * ARB_SIZE_PCT;
+    let size = size_from_pct.min(MAX_ARB_SIZE).round_dp(2);
 
-    // Use configurable volatility factors
-    let vol_factor = if current_spread > config.wide_spread_threshold {
-        config.high_vol_factor
-    } else {
-        config.low_vol_factor
-    };
-
-    let dynamic_size =
-        (config.edge / config.variance) * config.kelly_fraction * balance_f64 * vol_factor;
-    let capped_size = dynamic_size.min(balance_f64 * config.max_exposure_pct / 4.0);
-
-    if total_exposure_f64 + (capped_size * 4.0) > balance_f64 * config.max_exposure_pct {
-        warn!("Exposure cap hit; skipping cycle for {}", yes_token);
-        return Ok(());
-    }
-
-    let size = decimal_from_f64(capped_size, "order_size")?.round_dp(2);
     if size <= Decimal::ZERO {
-        warn!("Skipping {}: non-positive order size", yes_token);
+        warn!("Skipping arb: non-positive size");
         return Ok(());
     }
 
-    // Calculate mid prices using compile-time constant (no runtime unwrap)
-    let mid_yes = (best_bid_yes + best_ask_yes) / DECIMAL_TWO;
-    let mid_no = (best_bid_no + best_ask_no) / DECIMAL_TWO;
+    // Check exposure cap (max 30% of balance in arb positions)
+    let max_arb_exposure = balance * Decimal::from_parts(30, 0, 0, false, 2); // 30%
+    let new_exposure = size * price_sum * Decimal::from(2); // Both sides
+    if total_arb_exposure + new_exposure > max_arb_exposure {
+        debug!(
+            "Skipping arb: exposure cap ({:.2} + {:.2} > {:.2})",
+            total_arb_exposure, new_exposure, max_arb_exposure
+        );
+        return Ok(());
+    }
 
-    let tick_yes = book_yes.tick_size.as_decimal();
-    let tick_no = book_no.tick_size.as_decimal();
-
-    // Calculate inventory skew for YES token
-    // Positive exposure (long) -> widen sell spread, tighten buy spread
-    // Negative exposure (short) -> opposite
-    let max_exposure_dec = decimal_from_f64(balance_f64 * config.max_exposure_pct, "max_exp")?;
-    let yes_skew = if max_exposure_dec > Decimal::ZERO {
-        (yes_exposure / max_exposure_dec)
-            .min(Decimal::ONE)
-            .max(-Decimal::ONE)
-    } else {
-        Decimal::ZERO
-    };
-    let no_skew = if max_exposure_dec > Decimal::ZERO {
-        (no_exposure / max_exposure_dec)
-            .min(Decimal::ONE)
-            .max(-Decimal::ONE)
-    } else {
-        Decimal::ZERO
-    };
-
-    // Skew multiplier: when long, less aggressive buy (wider), more aggressive sell (tighter to offload)
-    // buy_skew < 1 when long (smaller offset = more aggressive buy price)
-    // sell_skew > 1 when long (larger offset = less aggressive sell price)
-    let yes_buy_skew = Decimal::ONE - (yes_skew * SKEW_FACTOR);
-    let yes_sell_skew = Decimal::ONE + (yes_skew * SKEW_FACTOR);
-    let no_buy_skew = Decimal::ONE - (no_skew * SKEW_FACTOR);
-    let no_sell_skew = Decimal::ONE + (no_skew * SKEW_FACTOR);
-
-    let buy_yes_price = quantize_price(mid_yes - config.offset * yes_buy_skew, tick_yes, false);
-    let sell_yes_price = quantize_price(mid_yes + config.offset * yes_sell_skew, tick_yes, true);
-    let buy_no_price = quantize_price(mid_no - config.offset * no_buy_skew, tick_no, false);
-    let sell_no_price = quantize_price(mid_no + config.offset * no_sell_skew, tick_no, true);
-
-    // Get paper order count for IDs (if in paper mode)
-    let base_order_num = if config.paper_trade {
+    // Generate arb position ID
+    let (arb_id, base_order_num) = {
         let mut locked = state.write().await;
-        let num = locked.paper_order_count;
-        locked.paper_order_count += 4; // Reserve 4 order numbers
-        num
-    } else {
-        0
+        let id = locked.arb_position_count;
+        locked.arb_position_count += 1;
+        locked.paper_order_count += 2; // Reserve 2 order numbers (YES and NO buys only)
+        (format!("arb_{}", id), locked.paper_order_count - 2)
     };
 
-    // Place all 4 orders in parallel for better performance
+    // Place BUY orders for BOTH YES and NO (maker, post-only style)
+    // NO SELL ORDERS - we hold to resolution
     let order_specs = [
-        (yes_token, Side::Buy, buy_yes_price, "Buy YES", base_order_num),
-        (yes_token, Side::Sell, sell_yes_price, "Sell YES", base_order_num + 1),
-        (no_token, Side::Buy, buy_no_price, "Buy NO", base_order_num + 2),
-        (no_token, Side::Sell, sell_no_price, "Sell NO", base_order_num + 3),
+        (yes_token, Side::Buy, best_ask_yes, "Arb Buy YES", base_order_num),
+        (no_token, Side::Buy, best_ask_no, "Arb Buy NO", base_order_num + 1),
     ];
 
     let order_futures = order_specs.map(|(token, side, price, label, order_num)| {
@@ -1380,57 +1500,95 @@ async fn provide_liquidity<S: Signer + Sync>(
 
     let results = futures_util::future::join_all(order_futures).await;
 
-    // Collect successful orders (both ID and paper order details if applicable)
-    let mut order_ids: Vec<String> = Vec::new();
+    // Track results
+    let mut yes_order_id: Option<String> = None;
+    let mut no_order_id: Option<String> = None;
     let mut paper_orders_to_add: Vec<PaperOrder> = Vec::new();
 
-    for result in results {
+    for (i, result) in results.into_iter().enumerate() {
         match result {
             Ok(Some((id, paper_order))) => {
-                order_ids.push(id);
+                if i == 0 {
+                    yes_order_id = Some(id.clone());
+                } else {
+                    no_order_id = Some(id.clone());
+                }
                 if let Some(po) = paper_order {
                     paper_orders_to_add.push(po);
                 }
             }
-            Ok(None) => {} // Order failed but not an error
+            Ok(None) => {
+                warn!("Arb order {} failed", if i == 0 { "YES" } else { "NO" });
+            }
             Err(e) => {
-                warn!("Order placement error: {:?}", e);
+                warn!("Arb order placement error: {:?}", e);
             }
         }
     }
 
-    if !order_ids.is_empty() {
+    // Only create arb position if both orders were placed
+    if yes_order_id.is_some() && no_order_id.is_some() {
         let now = systemtime_now_secs();
         let mut locked = state.write().await;
 
-        for id in &order_ids {
+        // Track orders
+        if let Some(ref id) = yes_order_id {
             locked.open_orders.insert(id.clone(), now);
         }
-
-        // Track total orders placed
-        locked.orders_placed += order_ids.len() as u64;
+        if let Some(ref id) = no_order_id {
+            locked.open_orders.insert(id.clone(), now);
+        }
+        locked.orders_placed += 2;
 
         // Store paper orders for fill simulation
         if config.paper_trade {
             for po in paper_orders_to_add {
                 locked.paper_orders.insert(po.id.clone(), po);
             }
+        }
+
+        // Create and track arb position
+        let arb_position = ArbPosition {
+            id: arb_id.clone(),
+            yes_token: yes_token.to_string(),
+            no_token: no_token.to_string(),
+            target_size: size,
+            cost_per_share: price_sum,
+            yes_filled: Decimal::ZERO,
+            no_filled: Decimal::ZERO,
+            yes_price: best_ask_yes,
+            no_price: best_ask_no,
+            created_at: now,
+            resolved: false,
+            resolved_pnl: Decimal::ZERO,
+        };
+
+        locked.arb_positions.insert(arb_id.clone(), arb_position);
+        locked.arb_opportunities_found += 1;
+
+        info!(
+            "{}ARB POSITION OPENED: {} | Size: {} | Cost: {:.4}/share | Expected profit: {:.2}%",
+            if config.paper_trade { "[PAPER] " } else { "" },
+            arb_id, size, price_sum, expected_profit_pct
+        );
+
+        if config.paper_trade {
             info!(
-                "[PAPER] Placed {} orders. Balance: ${:.2}, Open orders: {}, Fills: {}, P&L: ${:.2}",
-                order_ids.len(),
+                "[PAPER] Balance: ${:.2} | Open arb positions: {} | Total arb profit: ${:.2}",
                 locked.paper_balance,
-                locked.paper_orders.len(),
-                locked.paper_fills,
-                locked.paper_realized_pnl
+                locked.arb_positions.len(),
+                locked.arb_total_profit
             );
         }
+    } else {
+        // One side failed - cancel the other if it was placed
+        // In paper mode, just log
+        warn!(
+            "Arb position incomplete - YES: {:?}, NO: {:?}",
+            yes_order_id, no_order_id
+        );
     }
 
-    info!(
-        "{}Placed hedged quotes with size {} for YES {} and NO {}",
-        if config.paper_trade { "[PAPER] " } else { "" },
-        size, yes_token, no_token
-    );
     Ok(())
 }
 
@@ -1889,6 +2047,278 @@ where
     }
 }
 
+/// Poll trades from the data API for paper fill simulation
+/// This runs alongside WebSocket as a backup when WS fails
+async fn poll_trades_for_paper_fills(
+    state: Arc<RwLock<BotState>>,
+    http_client: HttpClient,
+    config: Config,
+    shutdown: CancellationToken,
+) {
+    const POLL_INTERVAL_SECS: u64 = 5;
+    const DATA_API: &str = "https://data-api.polymarket.com";
+
+    // Start with 0 to process all trades on first poll, then track the max seen
+    let mut last_seen_timestamp: u64 = 0;
+
+    info!("Starting trade polling for paper fill simulation...");
+
+    loop {
+        if shutdown.is_cancelled() {
+            info!("Trade polling shutting down...");
+            break;
+        }
+
+        sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+
+        // Get our tracked token IDs
+        let tracked_tokens: HashSet<String> = {
+            let locked = state.read().await;
+            locked.active_markets
+                .iter()
+                .flat_map(|(yes, no)| vec![yes.clone(), no.clone()])
+                .collect()
+        };
+
+        if tracked_tokens.is_empty() {
+            info!("[POLL] No tracked tokens yet, skipping...");
+            continue;
+        }
+
+        // Fetch recent trades from the data API
+        let url = format!("{}/trades?limit=100", DATA_API);
+        let trades = match http_client
+            .get(&url)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<Vec<ApiTrade>>().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        debug!("Failed to parse trades: {:?}", e);
+                        continue;
+                    }
+                }
+            }
+            Ok(resp) => {
+                debug!("Trades API returned {}", resp.status());
+                continue;
+            }
+            Err(e) => {
+                debug!("Trades fetch failed: {:?}", e);
+                continue;
+            }
+        };
+
+        // Filter and process trades
+        let mut fill_count = 0;
+        let mut newer_count = 0;
+        let mut matched_count = 0;
+
+        // Log diagnostic info every poll
+        let newest_ts = trades.iter().map(|t| t.timestamp).max().unwrap_or(0);
+        if !trades.is_empty() {
+            let oldest_ts = trades.iter().map(|t| t.timestamp).min().unwrap_or(0);
+            info!("[POLL] Fetched {} trades, timestamps: {} to {}, last_seen: {}, tracked tokens: {}",
+                trades.len(), oldest_ts, newest_ts, last_seen_timestamp, tracked_tokens.len());
+        }
+
+        for trade in &trades {
+            // Only process trades newer than what we've already seen
+            if trade.timestamp <= last_seen_timestamp {
+                continue;
+            }
+            newer_count += 1;
+
+            // Only process trades for our tracked assets
+            if !tracked_tokens.contains(&trade.asset) {
+                continue;
+            }
+            matched_count += 1;
+
+            info!("[POLL] Matched trade: {} {} @ {} on {}", trade.side, trade.size, trade.price, &trade.asset[..30]);
+
+            // Convert trade data
+            let trade_side = if trade.side.to_uppercase() == "BUY" {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
+
+            let trade_size = match Decimal::from_f64(trade.size) {
+                Some(d) => d,
+                None => continue,
+            };
+
+            let trade_price = match Decimal::from_f64(trade.price) {
+                Some(d) => d,
+                None => continue,
+            };
+
+            // Inline paper fill simulation (avoiding non-exhaustive TradeMessage)
+            {
+                let mut locked = state.write().await;
+
+                // Track last trade price for unrealized P&L
+                locked.last_trade_prices.insert(trade.asset.clone(), trade_price);
+
+                let mut trade_remaining = trade_size;
+
+                // Find matching paper orders with their data
+                let matching_orders: Vec<(String, String, Side, Decimal, Decimal, Decimal)> = locked
+                    .paper_orders
+                    .iter()
+                    .filter(|(_, order)| {
+                        order.token_id == trade.asset && order.filled < order.size && {
+                            match (&order.side, &trade_side) {
+                                (Side::Buy, Side::Sell) => trade_price <= order.price,
+                                (Side::Sell, Side::Buy) => trade_price >= order.price,
+                                _ => false,
+                            }
+                        }
+                    })
+                    .map(|(id, order)| (id.clone(), order.token_id.clone(), order.side.clone(), order.price, order.size, order.filled))
+                    .collect();
+
+                for (order_id, token_id, order_side, order_price, order_size, order_filled) in matching_orders {
+                    if trade_remaining <= Decimal::ZERO {
+                        break;
+                    }
+
+                    let unfilled = order_size - order_filled;
+                    let fill_size = unfilled.min(trade_remaining);
+
+                    if fill_size <= Decimal::ZERO {
+                        continue;
+                    }
+
+                    // Calculate slippage
+                    let fill_ratio = fill_size / (trade_size + Decimal::ONE);
+                    let slippage = MAX_SLIPPAGE * fill_ratio;
+
+                    let fill_price = match order_side {
+                        Side::Buy => order_price * (Decimal::ONE + slippage),
+                        Side::Sell => order_price * (Decimal::ONE - slippage),
+                        _ => order_price,
+                    };
+
+                    // Calculate value and rebate
+                    let fill_value = fill_price * fill_size;
+                    let rebate = fill_value * config.rebate_rate;
+
+                    // Update order filled amount
+                    if let Some(order) = locked.paper_orders.get_mut(&order_id) {
+                        order.filled = order.filled + fill_size;
+                    }
+                    trade_remaining = trade_remaining - fill_size;
+                    let new_filled = order_filled + fill_size;
+
+                    // Update balance, exposure, and track P&L
+                    match order_side {
+                        Side::Buy => {
+                            // Deduct cash for purchase
+                            locked.paper_balance = locked.paper_balance - fill_value + rebate;
+
+                            // Track inventory - we now own these tokens
+                            let current_exp = locked.exposure.entry(token_id.clone()).or_insert(Decimal::ZERO);
+                            let old_exp = *current_exp;
+                            *current_exp = *current_exp + fill_size;
+
+                            // Update entry price using weighted average with actual position
+                            let entry = locked.paper_entry_prices.entry(token_id.clone()).or_insert(Decimal::ZERO);
+                            if old_exp + fill_size > Decimal::ZERO {
+                                *entry = (*entry * old_exp + fill_price * fill_size) / (old_exp + fill_size);
+                            } else {
+                                *entry = fill_price;
+                            }
+                        }
+                        Side::Sell => {
+                            // Check if we have inventory to sell
+                            let current_exp = locked.exposure.get(&token_id).copied().unwrap_or(Decimal::ZERO);
+                            if current_exp < fill_size {
+                                // Cannot sell more than we own - skip this fill
+                                warn!("[PAPER] Skipping sell of {} - only have {} inventory",
+                                    fill_size, current_exp);
+                                continue;
+                            }
+
+                            // Calculate P&L before updating
+                            let entry_price = locked.paper_entry_prices.get(&token_id).copied().unwrap_or(fill_price);
+                            let pnl = (fill_price - entry_price) * fill_size;
+                            locked.paper_realized_pnl = locked.paper_realized_pnl + pnl;
+
+                            // Credit cash for sale
+                            locked.paper_balance = locked.paper_balance + fill_value + rebate;
+
+                            // Reduce inventory
+                            let exp = locked.exposure.entry(token_id.clone()).or_insert(Decimal::ZERO);
+                            *exp = *exp - fill_size;
+
+                            // Clear entry price if position is closed
+                            if *exp <= Decimal::ZERO {
+                                locked.paper_entry_prices.remove(&token_id);
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    locked.paper_rebates_earned = locked.paper_rebates_earned + rebate;
+                    locked.paper_fills += 1;
+
+                    // Calculate fill P&L for display
+                    let fill_pnl = match order_side {
+                        Side::Sell => {
+                            let entry = locked.paper_entry_prices.get(&token_id).copied().unwrap_or(fill_price);
+                            (fill_price - entry) * fill_size
+                        }
+                        _ => Decimal::ZERO,
+                    };
+
+                    // Record fill for dashboard
+                    let fill_record = FillRecord {
+                        time: chrono::Utc::now().format("%H:%M:%S").to_string(),
+                        side: if order_side == Side::Buy { "BUY".to_string() } else { "SELL".to_string() },
+                        size: format!("{:.2}", fill_size),
+                        price: format!("{:.4}", fill_price),
+                        value: format!("${:.2}", fill_value),
+                        rebate: format!("${:.4}", rebate),
+                        pnl: if fill_pnl != Decimal::ZERO { format!("${:.2}", fill_pnl) } else { "-".to_string() },
+                    };
+                    locked.recent_fills.push(fill_record);
+
+                    // Keep only last 100 fills
+                    if locked.recent_fills.len() > 100 {
+                        locked.recent_fills.remove(0);
+                    }
+
+                    info!(
+                        "[PAPER-POLL] FILL: {:?} {} @ {} (slippage: {:.2}%) | Value: ${:.2} | Rebate: ${:.4}",
+                        order_side,
+                        fill_size,
+                        fill_price.round_dp(4),
+                        slippage * Decimal::from(100),
+                        fill_value,
+                        rebate
+                    );
+                }
+            }
+            fill_count += 1;
+        }
+
+        if newer_count > 0 || matched_count > 0 {
+            info!("[POLL] Summary: {} newer, {} matched our tokens, {} processed fills",
+                newer_count, matched_count, fill_count);
+        }
+
+        // Update to the max timestamp we've seen so far
+        if newest_ts > last_seen_timestamp {
+            last_seen_timestamp = newest_ts;
+        }
+    }
+}
+
 /// Get current time in seconds since UNIX epoch (safe from clock skew)
 fn systemtime_now_secs() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -1943,6 +2373,35 @@ async fn api_handler(State(app_state): State<AppState>) -> Json<DashboardData> {
         Decimal::ZERO
     };
 
+    // Build positions list with unrealized P&L
+    let mut total_position_cost = Decimal::ZERO;
+    let mut total_unrealized_pnl = Decimal::ZERO;
+
+    let positions: Vec<PositionData> = locked.exposure
+        .iter()
+        .filter(|(_, size)| **size > Decimal::ZERO)
+        .map(|(token_id, size)| {
+            let entry_price = locked.paper_entry_prices.get(token_id).copied().unwrap_or(Decimal::ZERO);
+            let current_price = locked.last_trade_prices.get(token_id).copied().unwrap_or(entry_price);
+            let cost_basis = *size * entry_price;
+            let market_value = *size * current_price;
+            let unrealized = market_value - cost_basis;
+
+            total_position_cost = total_position_cost + cost_basis;
+            total_unrealized_pnl = total_unrealized_pnl + unrealized;
+
+            PositionData {
+                token_id_short: format!("{}...", &token_id[..16.min(token_id.len())]),
+                size: format!("{:.2}", size),
+                entry_price: format!("{:.4}", entry_price),
+                current_price: format!("{:.4}", current_price),
+                cost_basis: format!("{:.2}", cost_basis),
+                market_value: format!("{:.2}", market_value),
+                unrealized_pnl: format!("{:+.2}", unrealized),
+            }
+        })
+        .collect();
+
     Json(DashboardData {
         paper_mode: app_state.config.paper_trade,
         uptime_secs: app_state.start_time.elapsed().as_secs(),
@@ -1950,11 +2409,14 @@ async fn api_handler(State(app_state): State<AppState>) -> Json<DashboardData> {
         current_balance: format!("{:.2}", current),
         total_return_pct: format!("{:.2}", return_pct),
         realized_pnl: format!("{:.2}", locked.paper_realized_pnl),
+        unrealized_pnl: format!("{:+.2}", total_unrealized_pnl),
+        position_cost: format!("{:.2}", total_position_cost),
         rebates_earned: format!("{:.4}", locked.paper_rebates_earned),
         fees_paid: format!("{:.4}", locked.paper_fees_paid),
         total_fills: locked.paper_fills,
         open_orders: locked.paper_orders.len(),
         tracked_positions: locked.exposure.len(),
+        positions,
         recent_fills: locked.recent_fills.iter().rev().take(20).cloned().collect(),
         timestamp: Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string(),
         market_count: locked.active_markets.len(),
@@ -2127,6 +2589,14 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     </div>
 
     <div class="panel">
+      <h2>Open Positions <span id="unrealized-total" style="font-size: 14px; font-weight: normal;"></span></h2>
+      <table>
+        <thead><tr><th>Token</th><th>Size</th><th>Entry</th><th>Current</th><th>Cost</th><th>Value</th><th>P&L</th></tr></thead>
+        <tbody id="positions-table"></tbody>
+      </table>
+    </div>
+
+    <div class="panel">
       <h2>Recent Fills</h2>
       <table>
         <thead><tr><th>Time</th><th>Side</th><th>Size</th><th>Price</th><th>Value</th><th>Rebate</th><th>P&L</th></tr></thead>
@@ -2192,6 +2662,23 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           document.getElementById('last-error').textContent = d.last_error;
         } else {
           errorPanel.style.display = 'none';
+        }
+
+        // Positions table with unrealized P&L
+        const positionsBody = document.getElementById('positions-table');
+        const unrealizedEl = document.getElementById('unrealized-total');
+        const unrealized = parseFloat(d.unrealized_pnl);
+        unrealizedEl.textContent = '(Unrealized: ' + d.unrealized_pnl + ')';
+        unrealizedEl.style.color = unrealized >= 0 ? 'var(--accent)' : 'var(--danger)';
+
+        if (!d.positions || d.positions.length === 0) {
+          positionsBody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted);">No open positions</td></tr>';
+        } else {
+          positionsBody.innerHTML = d.positions.map(p => {
+            const pnlVal = parseFloat(p.unrealized_pnl);
+            const pnlClass = pnlVal >= 0 ? 'pnl-positive' : 'pnl-negative';
+            return '<tr><td>' + p.token_id_short + '</td><td>' + p.size + '</td><td>' + p.entry_price + '</td><td>' + p.current_price + '</td><td>$' + p.cost_basis + '</td><td>$' + p.market_value + '</td><td class="' + pnlClass + '">' + p.unrealized_pnl + '</td></tr>';
+          }).join('');
         }
 
         document.getElementById('timestamp').textContent = 'Last updated: ' + d.timestamp;
