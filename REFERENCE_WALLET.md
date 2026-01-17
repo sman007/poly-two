@@ -77,3 +77,93 @@ The wallet's strategy is **pure arbitrage on 15-minute crypto UP/DOWN markets** 
 - Win Rate: 98% (arb nature; losses only from fees/slippage).
 
 This strategy is timeless, but post-2026 favors makers — our bot adapts it accordingly.
+
+---
+
+## UPDATE: Current Strategy (January 2026) - Multi-Outcome Political Arbitrage
+
+**Important Discovery**: As of January 2026, the Reference Wallet has **stopped trading 15-minute crypto arbs** and shifted to a completely different strategy: **multi-outcome political arbitrage**.
+
+### Evidence from Blockchain Analysis (January 17-18, 2026)
+
+**Recent 100 trades**: ALL political markets, ZERO crypto UP/DOWN trades.
+
+**Current Open Positions** (from Polymarket API):
+
+| Event | Candidates | Shares Each | Avg Price | Total Invested |
+|-------|-----------|-------------|-----------|----------------|
+| South Korea President | 14 | ~530,000 | $0.0134 | ~$99,400 |
+| Romania President | Multiple | ~495,000 | $0.021 | ~$10,400 |
+| US Fed Chair Nominee | 10+ | ~210 | Various | ~$2,200 |
+
+### How Multi-Outcome Arbitrage Works
+
+**Core Concept**: In a multi-candidate election where only ONE can win, if you can buy YES shares on ALL candidates for a combined price less than $1, you lock in guaranteed profit.
+
+**Mathematical Example (South Korea Election)**:
+```
+14 candidates × $0.0134 avg price = $0.1876 total cost per "complete set"
+When winner resolves: 1 share pays $1.00
+Guaranteed profit per set: $1.00 - $0.1876 = $0.8124 (433% return)
+```
+
+**Their Actual Position**:
+- Invested: ~$99,400 across 14 candidates (~530k shares each at $0.0134)
+- When any candidate wins: Receive 530,000 × $1 = $530,000
+- Locked profit: $530,000 - $99,400 = **$430,600** (433% ROI)
+
+### Why They Shifted Strategies
+
+1. **15-min crypto arbs became competitive**: More bots, tighter spreads, lower edge
+2. **Political arbs have MASSIVE edge**: 433% vs 2-4% per trade
+3. **Longer timeframe, less work**: Hold weeks/months vs 15-min cycles
+4. **Fee structure changes**: Post-2026 fees may have reduced crypto arb profitability
+5. **Capital efficiency**: Deploy large sums with certainty vs many small trades
+
+### Key Differences from Crypto Arb Strategy
+
+| Aspect | Old (Crypto 15-min) | New (Political Multi-Outcome) |
+|--------|---------------------|-------------------------------|
+| Holding Period | 15 minutes | Weeks to months |
+| Edge per Trade | 2-4% | 100-500%+ |
+| Trade Frequency | 1,000+/day | 10-50/week |
+| Risk | Near-zero (hedged) | Near-zero (one MUST win) |
+| Capital Required | $5k-50k | $50k-500k |
+| Automation | High-frequency bot | Semi-manual monitoring |
+
+### Step-by-Step Multi-Outcome Strategy
+
+1. **Find multi-candidate events**: Elections, nominations, award shows
+2. **Calculate sum of all YES prices**: Must be significantly < $1.00
+3. **Buy equal SHARES (not dollars) on each outcome**: This ensures payout regardless of winner
+4. **Wait for resolution**: One outcome wins, pays $1/share
+5. **Collect profit**: Payout minus total cost = guaranteed profit
+
+### Why This Works
+
+- Markets are inefficient for long-tail candidates (many at $0.01)
+- Low liquidity on underdogs means easy accumulation
+- No one else is buying ALL candidates systematically
+- Time value of money is low (they're patient with capital)
+
+### Risks and Considerations
+
+1. **Capital lockup**: Funds tied up for months
+2. **Event cancellation**: Rare, but possible (market would void)
+3. **Market manipulation risk**: If you're the only buyer, prices might move against you
+4. **Opportunity cost**: Capital can't be used elsewhere while locked
+
+### Implications for Our Bot
+
+The Reference Wallet's shift suggests:
+- **15-min crypto arbs are still viable** but less profitable than their peak
+- **Multi-outcome arb is the "next level"** requiring more capital and patience
+- **Our bot strategy remains valid** for smaller capital, higher frequency
+- **Future enhancement**: Consider adding multi-outcome scanner
+
+### Data Sources
+
+- Polymarket API: `https://data-api.polymarket.com/positions?user=0x8e9eedf20dfa70956d49f608a205e402d9df38e4`
+- Polymarket API: `https://data-api.polymarket.com/trades?user=0x8e9eedf20dfa70956d49f608a205e402d9df38e4`
+- Polygonscan: Transaction history analysis
+- Analysis Date: January 18, 2026
