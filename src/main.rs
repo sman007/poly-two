@@ -402,16 +402,16 @@ struct FillRecord {
     pnl: String,
 }
 
-/// Position data for dashboard display
+/// Arb position data for dashboard display (hedged pairs)
 #[derive(Debug, Clone, Serialize)]
-struct PositionData {
-    token_id_short: String,
+struct ArbPositionData {
+    id_short: String,
     size: String,
-    entry_price: String,
-    current_price: String,
-    cost_basis: String,
-    market_value: String,
-    unrealized_pnl: String,
+    cost_per_share: String,
+    guaranteed_profit: String,
+    spread_pct: String,
+    age_secs: u64,
+    status: String,
 }
 
 /// Dashboard API response
@@ -420,26 +420,29 @@ struct DashboardData {
     paper_mode: bool,
     uptime_secs: u64,
     starting_balance: String,
-    current_balance: String,
-    total_return_pct: String,
-    realized_pnl: String,
-    unrealized_pnl: String,
-    position_cost: String,
+    available_balance: String,
+    deployed_capital: String,
+    // Clear P&L metrics
+    realized_profit: String,
+    pending_profit: String,
+    total_profit: String,
     rebates_earned: String,
     fees_paid: String,
     total_fills: u64,
     open_orders: usize,
-    tracked_positions: usize,
-    positions: Vec<PositionData>,
+    open_arbs: usize,
+    arb_positions: Vec<ArbPositionData>,
     recent_fills: Vec<FillRecord>,
     timestamp: String,
-    // New stats
+    // Stats
     market_count: usize,
     api_latency_ms: u64,
     ws_connected: bool,
     loop_count: u64,
     orders_placed: u64,
     last_error: Option<String>,
+    exposure_pct: String,
+    max_exposure_pct: String,
 }
 
 /// Shared state for web dashboard
@@ -2703,66 +2706,84 @@ async fn run_dashboard_server(app_state: AppState) {
 async fn api_handler(State(app_state): State<AppState>) -> Json<DashboardData> {
     let locked = app_state.bot_state.read().await;
     let starting = app_state.config.paper_starting_balance;
-    let current = locked.paper_balance;
-    let return_pct = if starting > Decimal::ZERO {
-        ((current - starting) / starting) * Decimal::from(100)
-    } else {
-        Decimal::ZERO
-    };
+    let available = locked.paper_balance;
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
-    // Build positions list with unrealized P&L
-    let mut total_position_cost = Decimal::ZERO;
-    let mut total_unrealized_pnl = Decimal::ZERO;
+    // Calculate arb-focused metrics from arb_positions
+    let mut deployed_capital = Decimal::ZERO;
+    let mut pending_profit = Decimal::ZERO;
+    let mut open_arb_count = 0usize;
 
-    let positions: Vec<PositionData> = locked
-        .exposure
-        .iter()
-        .filter(|(_, size)| **size > Decimal::ZERO)
-        .map(|(token_id, size)| {
-            let entry_price = locked
-                .paper_entry_prices
-                .get(token_id)
-                .copied()
-                .unwrap_or(Decimal::ZERO);
-            let current_price = locked
-                .last_trade_prices
-                .get(token_id)
-                .copied()
-                .unwrap_or(entry_price);
-            let cost_basis = *size * entry_price;
-            let market_value = *size * current_price;
-            let unrealized = market_value - cost_basis;
+    let arb_positions: Vec<ArbPositionData> = locked
+        .arb_positions
+        .values()
+        .filter(|arb| !arb.resolved)
+        .map(|arb| {
+            // Filled amount (min of YES/NO for hedged calculation)
+            let filled = arb.yes_filled.min(arb.no_filled);
+            // Cost = filled * (yes_price + no_price)
+            let cost = filled * arb.cost_per_share;
+            // Guaranteed profit = filled * (1 - cost_per_share)
+            let profit = filled * (Decimal::ONE - arb.cost_per_share);
+            // Spread = (1 - cost_per_share) * 100
+            let spread = (Decimal::ONE - arb.cost_per_share) * Decimal::from(100);
+            // Age
+            let age = now_ts.saturating_sub(arb.created_at);
 
-            total_position_cost = total_position_cost + cost_basis;
-            total_unrealized_pnl = total_unrealized_pnl + unrealized;
+            deployed_capital += cost;
+            pending_profit += profit;
+            open_arb_count += 1;
 
-            PositionData {
-                token_id_short: format!("{}...", &token_id[..16.min(token_id.len())]),
-                size: format!("{:.2}", size),
-                entry_price: format!("{:.4}", entry_price),
-                current_price: format!("{:.4}", current_price),
-                cost_basis: format!("{:.2}", cost_basis),
-                market_value: format!("{:.2}", market_value),
-                unrealized_pnl: format!("{:+.2}", unrealized),
+            let status = if arb.yes_filled == arb.no_filled && arb.yes_filled >= arb.target_size {
+                "Filled".to_string()
+            } else {
+                format!("Y:{:.0}/N:{:.0}", arb.yes_filled, arb.no_filled)
+            };
+
+            ArbPositionData {
+                id_short: format!("{}...", &arb.id[..8.min(arb.id.len())]),
+                size: format!("{:.2}", filled),
+                cost_per_share: format!("{:.4}", arb.cost_per_share),
+                guaranteed_profit: format!("{:.2}", profit),
+                spread_pct: format!("{:.2}%", spread),
+                age_secs: age,
+                status,
             }
         })
         .collect();
+
+    // Total profit = realized + pending
+    let realized = locked.paper_realized_pnl;
+    let total_profit = realized + pending_profit;
+
+    // Exposure percentage
+    let total_capital = available + deployed_capital;
+    let exposure_pct = if total_capital > Decimal::ZERO {
+        (deployed_capital / total_capital) * Decimal::from(100)
+    } else {
+        Decimal::ZERO
+    };
+    let max_exp =
+        Decimal::from_f64(app_state.config.max_exposure_pct * 100.0).unwrap_or(Decimal::from(70));
 
     Json(DashboardData {
         paper_mode: app_state.config.paper_trade,
         uptime_secs: app_state.start_time.elapsed().as_secs(),
         starting_balance: format!("{:.2}", starting),
-        current_balance: format!("{:.2}", current),
-        total_return_pct: format!("{:.2}", return_pct),
-        realized_pnl: format!("{:.2}", locked.paper_realized_pnl),
-        unrealized_pnl: format!("{:+.2}", total_unrealized_pnl),
-        position_cost: format!("{:.2}", total_position_cost),
+        available_balance: format!("{:.2}", available),
+        deployed_capital: format!("{:.2}", deployed_capital),
+        realized_profit: format!("{:.2}", realized),
+        pending_profit: format!("{:.2}", pending_profit),
+        total_profit: format!("{:.2}", total_profit),
         rebates_earned: format!("{:.4}", locked.paper_rebates_earned),
         fees_paid: format!("{:.4}", locked.paper_fees_paid),
         total_fills: locked.paper_fills,
         open_orders: locked.paper_orders.len(),
-        tracked_positions: locked.exposure.len(),
-        positions,
+        open_arbs: open_arb_count,
+        arb_positions,
         recent_fills: locked.recent_fills.iter().rev().take(20).cloned().collect(),
         timestamp: Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string(),
         market_count: locked.active_markets.len(),
@@ -2771,6 +2792,8 @@ async fn api_handler(State(app_state): State<AppState>) -> Json<DashboardData> {
         loop_count: locked.loop_count,
         orders_placed: locked.orders_placed,
         last_error: locked.last_error.clone(),
+        exposure_pct: format!("{:.1}%", exposure_pct),
+        max_exposure_pct: format!("{:.0}%", max_exp),
     })
 }
 
@@ -2871,11 +2894,12 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     </div>
 
     <div class="pnl-hero">
-      <div class="pnl-main pnl-positive" id="balance">$1000.00</div>
-      <div class="pnl-label">Current Balance</div>
+      <div class="pnl-main pnl-positive" id="total-profit">$0.00</div>
+      <div class="pnl-label">Total Profit (Realized + Pending)</div>
       <div style="margin-top:20px; display:flex; justify-content:center; gap:40px;">
-        <div><span style="font-size:28px; font-weight:700;" id="return-pct">0.00%</span><br><span class="pnl-label">Return</span></div>
-        <div><span style="font-size:28px; font-weight:700;" id="pnl">$0.00</span><br><span class="pnl-label">Realized P&L</span></div>
+        <div><span style="font-size:28px; font-weight:700;" id="realized">$0.00</span><br><span class="pnl-label">Realized</span></div>
+        <div><span style="font-size:28px; font-weight:700;" id="pending">$0.00</span><br><span class="pnl-label">Pending</span></div>
+        <div><span style="font-size:28px; font-weight:700;" id="rebates">$0.00</span><br><span class="pnl-label">Rebates</span></div>
       </div>
     </div>
 
@@ -2885,24 +2909,24 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <div class="stat-value" id="starting">$1000.00</div>
       </div>
       <div class="stat-card">
+        <div class="stat-label">Available</div>
+        <div class="stat-value" id="available">$1000.00</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Deployed</div>
+        <div class="stat-value" id="deployed">$0.00</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Exposure</div>
+        <div class="stat-value" id="exposure">0% / 70%</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Open Arbs</div>
+        <div class="stat-value" id="open-arbs">0</div>
+      </div>
+      <div class="stat-card">
         <div class="stat-label">Total Fills</div>
         <div class="stat-value" id="fills">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">Rebates Earned</div>
-        <div class="stat-value positive" id="rebates">$0.0000</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">Open Orders</div>
-        <div class="stat-value" id="orders">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">Positions</div>
-        <div class="stat-value" id="positions">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">Fees Paid</div>
-        <div class="stat-value" id="fees">$0.0000</div>
       </div>
     </div>
 
@@ -2935,10 +2959,10 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     </div>
 
     <div class="panel">
-      <h2>Open Positions <span id="unrealized-total" style="font-size: 14px; font-weight: normal;"></span></h2>
+      <h2>Arb Positions (Hedged Pairs)</h2>
       <table>
-        <thead><tr><th>Token</th><th>Size</th><th>Entry</th><th>Current</th><th>Cost</th><th>Value</th><th>P&L</th></tr></thead>
-        <tbody id="positions-table"></tbody>
+        <thead><tr><th>ID</th><th>Size</th><th>Cost/Share</th><th>Profit</th><th>Spread</th><th>Age</th><th>Status</th></tr></thead>
+        <tbody id="arb-table"></tbody>
       </table>
     </div>
 
@@ -2960,6 +2984,13 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       return h + 'h ' + m + 'm';
     }
 
+    function formatAge(secs) {
+      if (secs < 60) return secs + 's';
+      const m = Math.floor(secs / 60);
+      const s = secs % 60;
+      return m + 'm ' + s + 's';
+    }
+
     async function load() {
       try {
         const resp = await fetch('/api/data');
@@ -2969,30 +3000,30 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         document.getElementById('mode').className = 'badge ' + (d.paper_mode ? 'paper' : 'live');
         document.getElementById('uptime').textContent = formatUptime(d.uptime_secs);
 
-        const bal = parseFloat(d.current_balance);
-        const start = parseFloat(d.starting_balance);
-        const balEl = document.getElementById('balance');
-        balEl.textContent = '$' + d.current_balance;
-        balEl.className = 'pnl-main ' + (bal >= start ? 'pnl-positive' : 'pnl-negative');
+        // Main P&L display
+        const totalProfit = parseFloat(d.total_profit);
+        const profitEl = document.getElementById('total-profit');
+        profitEl.textContent = '$' + d.total_profit;
+        profitEl.className = 'pnl-main ' + (totalProfit >= 0 ? 'pnl-positive' : 'pnl-negative');
 
-        const retEl = document.getElementById('return-pct');
-        const retPct = parseFloat(d.total_return_pct);
-        retEl.textContent = d.total_return_pct + '%';
-        retEl.style.color = retPct >= 0 ? 'var(--accent)' : 'var(--danger)';
+        const realizedEl = document.getElementById('realized');
+        realizedEl.textContent = '$' + d.realized_profit;
+        realizedEl.style.color = parseFloat(d.realized_profit) >= 0 ? 'var(--accent)' : 'var(--danger)';
 
-        const pnlEl = document.getElementById('pnl');
-        const pnl = parseFloat(d.realized_pnl);
-        pnlEl.textContent = '$' + d.realized_pnl;
-        pnlEl.style.color = pnl >= 0 ? 'var(--accent)' : 'var(--danger)';
+        const pendingEl = document.getElementById('pending');
+        pendingEl.textContent = '$' + d.pending_profit;
+        pendingEl.style.color = 'var(--accent)';
 
-        document.getElementById('starting').textContent = '$' + d.starting_balance;
-        document.getElementById('fills').textContent = d.total_fills;
         document.getElementById('rebates').textContent = '$' + d.rebates_earned;
-        document.getElementById('orders').textContent = d.open_orders;
-        document.getElementById('positions').textContent = d.tracked_positions;
-        document.getElementById('fees').textContent = '$' + d.fees_paid;
 
-        // New stats
+        // Stats
+        document.getElementById('starting').textContent = '$' + d.starting_balance;
+        document.getElementById('available').textContent = '$' + d.available_balance;
+        document.getElementById('deployed').textContent = '$' + d.deployed_capital;
+        document.getElementById('exposure').textContent = d.exposure_pct + ' / ' + d.max_exposure_pct;
+        document.getElementById('open-arbs').textContent = d.open_arbs;
+        document.getElementById('fills').textContent = d.total_fills;
+
         document.getElementById('markets').textContent = d.market_count;
         const wsEl = document.getElementById('ws-status');
         wsEl.textContent = d.ws_connected ? 'Connected' : 'Disconnected';
@@ -3010,20 +3041,13 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           errorPanel.style.display = 'none';
         }
 
-        // Positions table with unrealized P&L
-        const positionsBody = document.getElementById('positions-table');
-        const unrealizedEl = document.getElementById('unrealized-total');
-        const unrealized = parseFloat(d.unrealized_pnl);
-        unrealizedEl.textContent = '(Unrealized: ' + d.unrealized_pnl + ')';
-        unrealizedEl.style.color = unrealized >= 0 ? 'var(--accent)' : 'var(--danger)';
-
-        if (!d.positions || d.positions.length === 0) {
-          positionsBody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted);">No open positions</td></tr>';
+        // Arb positions table
+        const arbBody = document.getElementById('arb-table');
+        if (!d.arb_positions || d.arb_positions.length === 0) {
+          arbBody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted);">No open arb positions</td></tr>';
         } else {
-          positionsBody.innerHTML = d.positions.map(p => {
-            const pnlVal = parseFloat(p.unrealized_pnl);
-            const pnlClass = pnlVal >= 0 ? 'pnl-positive' : 'pnl-negative';
-            return '<tr><td>' + p.token_id_short + '</td><td>' + p.size + '</td><td>' + p.entry_price + '</td><td>' + p.current_price + '</td><td>$' + p.cost_basis + '</td><td>$' + p.market_value + '</td><td class="' + pnlClass + '">' + p.unrealized_pnl + '</td></tr>';
+          arbBody.innerHTML = d.arb_positions.map(a => {
+            return '<tr><td>' + a.id_short + '</td><td>$' + a.size + '</td><td>$' + a.cost_per_share + '</td><td class="pnl-positive">$' + a.guaranteed_profit + '</td><td>' + a.spread_pct + '</td><td>' + formatAge(a.age_secs) + '</td><td>' + a.status + '</td></tr>';
           }).join('');
         }
 
