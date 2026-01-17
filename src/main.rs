@@ -1232,7 +1232,7 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
         return Err("REHEDGE_THRESHOLD_PCT must be between 0 and 1".into());
     }
 
-    let max_exposure_pct = parse_f64_env("MAX_EXPOSURE_PCT", "0.7")?; // 70% - arb positions are risk-free
+    let max_exposure_pct = parse_f64_env("MAX_EXPOSURE_PCT", "0.8")?; // 80% - arb positions are fully hedged/risk-free
     if !(0.0..=1.0).contains(&max_exposure_pct) {
         return Err("MAX_EXPOSURE_PCT must be between 0 and 1".into());
     }
