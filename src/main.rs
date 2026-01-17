@@ -132,8 +132,8 @@ struct ApiTrade {
 /// 15-minute interval in seconds
 const INTERVAL_15M: u64 = 900;
 
-/// Asset prefixes for 15-minute updown markets
-const UPDOWN_ASSETS: [&str; 2] = ["btc", "eth"];
+/// Asset prefixes for 15-minute updown markets (Reference Wallet: BTC/ETH/SOL)
+const UPDOWN_ASSETS: [&str; 3] = ["btc", "eth", "sol"];
 
 /// Calculate 15-minute window timestamps for discovery
 /// Returns timestamps for current window and next few windows
