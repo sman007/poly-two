@@ -1235,7 +1235,7 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     let paper_trade = env::var("PAPER_TRADE")
         .map(|v| v.to_lowercase() == "true" || v == "1")
         .unwrap_or(false);
-    let paper_starting_balance = parse_decimal_env("PAPER_STARTING_BALANCE", "1000.0")?;
+    let paper_starting_balance = parse_decimal_env("PAPER_STARTING_BALANCE", "10000.0")?;
 
     Ok(Config {
         wallet_private_key,
@@ -1553,9 +1553,12 @@ async fn find_arb_opportunity<S: Signer + Sync>(
         (locked.balance, arb_exposure)
     };
 
-    // Position sizing: 0.2% of balance per side, capped at $5k
-    let size_from_pct = balance * ARB_SIZE_PCT;
-    let size = size_from_pct.min(MAX_ARB_SIZE).round_dp(2);
+    // Position sizing: Kelly criterion (Reference Wallet style)
+    // Kelly formula: size = (edge / variance) * kelly_fraction * balance
+    // With defaults (edge=0.03, variance=0.01, kelly=0.2): 60% of balance per trade
+    let kelly_multiplier = (config.edge / config.variance) * config.kelly_fraction;
+    let kelly_size = Decimal::from_f64(kelly_multiplier).unwrap_or(ARB_SIZE_PCT) * balance;
+    let size = kelly_size.min(MAX_ARB_SIZE).round_dp(2);
 
     if size <= Decimal::ZERO {
         warn!("Skipping arb: non-positive size");
