@@ -1412,30 +1412,31 @@ async fn find_arb_opportunity<S: Signer + Sync>(
         locked.api_latency_ms = latency_ms;
     }
 
-    // Get best ASK prices (price to BUY)
-    let Some((_, best_ask_yes)) = best_bid_ask(&book_yes) else {
+    // Get best BID prices (Reference Wallet: "Buy YES and NO at best bid")
+    // We place limit orders at BID to be MAKER and earn rebates
+    let Some((best_bid_yes, _)) = best_bid_ask(&book_yes) else {
         debug!("Skipping {}: empty orderbook", yes_token);
         return Ok(());
     };
 
-    let Some((_, best_ask_no)) = best_bid_ask(&book_no) else {
+    let Some((best_bid_no, _)) = best_bid_ask(&book_no) else {
         debug!("Skipping {}: empty orderbook", no_token);
         return Ok(());
     };
 
-    // CORE ARB LOGIC: Check if YES_ask + NO_ask < threshold
-    // If so, we can buy both for less than $1 and get $1 at resolution
-    let price_sum = best_ask_yes + best_ask_no;
+    // CORE ARB LOGIC (Reference Wallet): Check if YES_bid + NO_bid < threshold
+    // Place bids, wait for sellers to fill us (MAKER), hold to resolution for $1
+    let price_sum = best_bid_yes + best_bid_no;
 
     // Determine if arb opportunity exists
     let is_maker_arb = price_sum < ARB_THRESHOLD_MAKER; // < 0.99
-    let is_taker_arb = price_sum < ARB_THRESHOLD_TAKER; // < 0.98
+    let _is_taker_arb = price_sum < ARB_THRESHOLD_TAKER; // < 0.98 (unused, maker-only)
 
     if !is_maker_arb {
         // No arb opportunity - sum >= 0.99
         debug!(
-            "No arb: YES_ask={:.4} + NO_ask={:.4} = {:.4} (need < {:.2})",
-            best_ask_yes, best_ask_no, price_sum, ARB_THRESHOLD_MAKER
+            "No arb: YES_bid={:.4} + NO_bid={:.4} = {:.4} (need < {:.2})",
+            best_bid_yes, best_bid_no, price_sum, ARB_THRESHOLD_MAKER
         );
         return Ok(());
     }
@@ -1443,9 +1444,9 @@ async fn find_arb_opportunity<S: Signer + Sync>(
     // ARB OPPORTUNITY FOUND!
     let expected_profit_pct = (Decimal::ONE - price_sum) * Decimal::from(100);
     info!(
-        "{}ARB FOUND: YES={:.4} + NO={:.4} = {:.4} | Profit: {:.2}%",
+        "{}ARB FOUND: YES_bid={:.4} + NO_bid={:.4} = {:.4} | Profit: {:.2}%",
         if config.paper_trade { "[PAPER] " } else { "" },
-        best_ask_yes, best_ask_no, price_sum, expected_profit_pct
+        best_bid_yes, best_bid_no, price_sum, expected_profit_pct
     );
 
     // Get current balance and calculate position size
@@ -1487,11 +1488,12 @@ async fn find_arb_opportunity<S: Signer + Sync>(
         (format!("arb_{}", id), locked.paper_order_count - 2)
     };
 
-    // Place BUY orders for BOTH YES and NO (maker, post-only style)
-    // NO SELL ORDERS - we hold to resolution
+    // Place BUY orders for BOTH YES and NO at BID prices (MAKER execution)
+    // Reference Wallet: "Buy YES and NO at best bid (or mid - offset for safety)"
+    // Orders rest on book, we earn maker rebate when sellers fill us
     let order_specs = [
-        (yes_token, Side::Buy, best_ask_yes, "Arb Buy YES", base_order_num),
-        (no_token, Side::Buy, best_ask_no, "Arb Buy NO", base_order_num + 1),
+        (yes_token, Side::Buy, best_bid_yes, "Arb Buy YES", base_order_num),
+        (no_token, Side::Buy, best_bid_no, "Arb Buy NO", base_order_num + 1),
     ];
 
     let order_futures = order_specs.map(|(token, side, price, label, order_num)| {
@@ -1556,8 +1558,8 @@ async fn find_arb_opportunity<S: Signer + Sync>(
             cost_per_share: price_sum,
             yes_filled: Decimal::ZERO,
             no_filled: Decimal::ZERO,
-            yes_price: best_ask_yes,
-            no_price: best_ask_no,
+            yes_price: best_bid_yes,
+            no_price: best_bid_no,
             created_at: now,
             resolved: false,
             resolved_pnl: Decimal::ZERO,
