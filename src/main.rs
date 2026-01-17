@@ -20,11 +20,13 @@ use polymarket_client_sdk::clob::types::response::OrderBookSummaryResponse;
 use polymarket_client_sdk::clob::types::{AssetType, OrderType, Side};
 use polymarket_client_sdk::clob::ws::{Client as WsClient, TradeMessage};
 use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
-use polymarket_client_sdk::types::{Address, Decimal};
+use polymarket_client_sdk::types::U256;
+use polymarket_client_sdk::types::{Address, Decimal, B256};
 use polymarket_client_sdk::POLYGON;
 use reqwest::Client as HttpClient;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -453,7 +455,7 @@ struct WsContext<S: Signer> {
     state: Arc<RwLock<BotState>>,
     credentials: Credentials,
     address: Address,
-    markets: Vec<String>,
+    markets: Vec<B256>,
     shutdown: CancellationToken,
     config: Config,
     client: SharedClient,
@@ -1298,11 +1300,18 @@ async fn fetch_market_ids(
     client: &SharedClient,
     token_ids: &[String],
     config: &Config,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+) -> Result<Vec<B256>, Box<dyn std::error::Error>> {
     let mut markets = HashSet::new();
     for token_id in token_ids {
+        let token_u256 = match token_to_u256(token_id) {
+            Ok(u) => u,
+            Err(e) => {
+                warn!("Invalid token ID {}: {:?}", token_id, e);
+                continue;
+            }
+        };
         let request = OrderBookSummaryRequest::builder()
-            .token_id(token_id)
+            .token_id(token_u256)
             .build();
         match timeout(
             Duration::from_secs(config.api_timeout_secs),
@@ -1322,6 +1331,29 @@ async fn fetch_market_ids(
         }
     }
     Ok(markets.into_iter().collect())
+}
+
+// ============================================================================
+// TOKEN ID HELPERS
+// ============================================================================
+
+/// Convert token ID string to U256 for SDK 0.4+
+fn token_to_u256(token_id: &str) -> Result<U256, Box<dyn std::error::Error>> {
+    U256::from_str(token_id).map_err(|e| -> Box<dyn std::error::Error> {
+        format!("Invalid token ID '{}': {}", token_id, e).into()
+    })
+}
+
+/// Convert token ID string to U256 (Send + Sync version for async contexts)
+fn token_to_u256_sync(token_id: &str) -> Result<U256, Box<dyn std::error::Error + Send + Sync>> {
+    U256::from_str(token_id).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("Invalid token ID '{}': {}", token_id, e).into()
+    })
+}
+
+/// Convert U256 token ID back to string for storage/display
+fn u256_to_token(u: &U256) -> String {
+    u.to_string()
 }
 
 // ============================================================================
@@ -1399,13 +1431,15 @@ async fn place_single_order<S: Signer + Sync>(
     }
 
     // Real trading mode
+    let token_u256 = token_to_u256_sync(token)?;
     let order = client
         .limit_order()
-        .token_id(token)
+        .token_id(token_u256)
         .side(side)
         .price(price)
         .size(size)
         .order_type(OrderType::GTC)
+        .post_only(true) // Reference Wallet: use post-only to ensure maker rebates
         .build()
         .await?;
     let signed = client.sign(signer, order).await?;
@@ -1432,12 +1466,12 @@ async fn find_arb_opportunity<S: Signer + Sync>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Track API latency - fetch both orderbooks in parallel
     let start = Instant::now();
+    let yes_u256 = token_to_u256(yes_token)?;
+    let no_u256 = token_to_u256(no_token)?;
     let req_yes = OrderBookSummaryRequest::builder()
-        .token_id(yes_token)
+        .token_id(yes_u256)
         .build();
-    let req_no = OrderBookSummaryRequest::builder()
-        .token_id(no_token)
-        .build();
+    let req_no = OrderBookSummaryRequest::builder().token_id(no_u256).build();
     let (book_yes_result, book_no_result) =
         tokio::join!(client.order_book(&req_yes), client.order_book(&req_no));
     let book_yes = book_yes_result?;
@@ -1802,9 +1836,10 @@ fn process_trade_sync(
     };
 
     let balance = state.balance;
+    let asset_id_str = u256_to_token(&trade.asset_id);
     let exposure = state
         .exposure
-        .entry(trade.asset_id.clone())
+        .entry(asset_id_str.clone())
         .or_insert(Decimal::ZERO);
     *exposure += delta;
     let current_exposure = *exposure;
@@ -1828,7 +1863,7 @@ fn process_trade_sync(
             config.rehedge_threshold_pct * 100.0,
             balance_f64
         );
-        Some((trade.asset_id.clone(), current_exposure))
+        Some((u256_to_token(&trade.asset_id), current_exposure))
     } else {
         None
     }
@@ -1847,7 +1882,7 @@ fn simulate_paper_fills(state: &mut BotState, trade: &TradeMessage, _config: &Co
         .paper_orders
         .iter()
         .filter(|(_, order)| {
-            order.token_id == trade.asset_id && order.filled < order.size && {
+            order.token_id == u256_to_token(&trade.asset_id) && order.filled < order.size && {
                 match (&order.side, &trade.side) {
                     // Our BUY fills when market SELLS at or below our price
                     (Side::Buy, Side::Sell) => trade_price <= order.price,
@@ -2014,12 +2049,15 @@ async fn rehedge_position<S: Signer + Sync>(
     exposure: Decimal,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Convert token_id to U256
+    let token_u256 = token_to_u256_sync(token_id)?;
+
     // Get current orderbook
     let book = match timeout(
         Duration::from_secs(config.api_timeout_secs),
         client.order_book(
             &OrderBookSummaryRequest::builder()
-                .token_id(token_id)
+                .token_id(token_u256)
                 .build(),
         ),
     )
@@ -2072,7 +2110,7 @@ async fn rehedge_position<S: Signer + Sync>(
 
     let order = client
         .limit_order()
-        .token_id(token_id)
+        .token_id(token_u256)
         .side(side)
         .price(price)
         .size(rehedge_size)
@@ -2852,5 +2890,4 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 </html>
 "##;
 
-// Required for Decimal::from_str
-use std::str::FromStr;
+// (FromStr already imported at top of file)

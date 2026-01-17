@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-polymarket-client-sdk = { version = "0.3", features = ["ws"] }
+polymarket-client-sdk = { version = "0.4", features = ["clob", "ws"] }
 tokio = { version = "1", features = ["full", "signal"] }
 tokio-util = "0.7"
 dotenv = "0.15"

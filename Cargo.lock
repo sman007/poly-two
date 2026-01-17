@@ -23,6 +23,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocator-api2"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+
+[[package]]
 name = "alloy"
 version = "1.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -31,10 +37,24 @@ dependencies = [
  "alloy-consensus",
  "alloy-core",
  "alloy-eips",
+ "alloy-provider",
+ "alloy-rpc-client",
  "alloy-serde",
  "alloy-signer",
  "alloy-signer-local",
+ "alloy-transport-http",
  "alloy-trie",
+]
+
+[[package]]
+name = "alloy-chains"
+version = "0.2.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25db5bcdd086f0b1b9610140a12c59b757397be90bd130d8d836fc8da0815a34"
+dependencies = [
+ "alloy-primitives",
+ "num_enum",
+ "strum",
 ]
 
 [[package]]
@@ -259,6 +279,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "alloy-provider"
+version = "1.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b56f7a77513308a21a2ba0e9d57785a9d9d2d609e77f4e71a78a1192b83ff2d"
+dependencies = [
+ "alloy-chains",
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-json-rpc",
+ "alloy-network",
+ "alloy-network-primitives",
+ "alloy-primitives",
+ "alloy-rpc-client",
+ "alloy-rpc-types-eth",
+ "alloy-signer",
+ "alloy-sol-types",
+ "alloy-transport",
+ "alloy-transport-http",
+ "async-stream",
+ "async-trait",
+ "auto_impl",
+ "dashmap",
+ "either",
+ "futures",
+ "futures-utils-wasm",
+ "lru",
+ "parking_lot",
+ "pin-project",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "url",
+ "wasmtimer",
+]
+
+[[package]]
 name = "alloy-rlp"
 version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -278,6 +337,29 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
+]
+
+[[package]]
+name = "alloy-rpc-client"
+version = "1.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff01723afc25ec4c5b04de399155bef7b6a96dfde2475492b1b7b4e7a4f46445"
+dependencies = [
+ "alloy-json-rpc",
+ "alloy-primitives",
+ "alloy-transport",
+ "alloy-transport-http",
+ "futures",
+ "pin-project",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tower",
+ "tracing",
+ "url",
+ "wasmtimer",
 ]
 
 [[package]]
@@ -422,6 +504,44 @@ dependencies = [
  "alloy-primitives",
  "alloy-sol-macro",
  "serde",
+]
+
+[[package]]
+name = "alloy-transport"
+version = "1.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f50a9516736d22dd834cc2240e5bf264f338667cc1d9e514b55ec5a78b987ca"
+dependencies = [
+ "alloy-json-rpc",
+ "auto_impl",
+ "base64 0.22.1",
+ "derive_more",
+ "futures",
+ "futures-utils-wasm",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
+ "wasmtimer",
+]
+
+[[package]]
+name = "alloy-transport-http"
+version = "1.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a18b541a6197cf9a084481498a766fdf32fefda0c35ea6096df7d511025e9f1"
+dependencies = [
+ "alloy-json-rpc",
+ "alloy-transport",
+ "reqwest 0.12.28",
+ "serde_json",
+ "tower",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -1830,6 +1950,8 @@ version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash",
  "serde",
  "serde_core",
@@ -2005,6 +2127,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2405,6 +2528,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
+name = "lru"
+version = "0.16.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1dc47f592c06f33f8e3aea9591776ec7c9f9e4124778ff8a3c3b87159f7e593"
+dependencies = [
+ "hashbrown 0.16.1",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2510,6 +2642,27 @@ checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
 dependencies = [
  "hermit-abi",
  "libc",
+]
+
+[[package]]
+name = "num_enum"
+version = "0.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1207a7e20ad57b847bbddc6776b968420d38292bbfe2089accff5e19e82454c"
+dependencies = [
+ "num_enum_derive",
+ "rustversion",
+]
+
+[[package]]
+name = "num_enum_derive"
+version = "0.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff32365de1b6743cb203b710788263c44a03de03802daf96092f2da4fe6ba4d7"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.114",
 ]
 
 [[package]]
@@ -2699,6 +2852,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "pin-project"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "677f1add503faace112b9f1373e43e9e054bfdd22ff1a63c1bc485eaec6a6a8a"
+dependencies = [
+ "pin-project-internal",
+]
+
+[[package]]
+name = "pin-project-internal"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e918e4ff8c4549eb882f14b3a4bc8c8bc93de829416eacf579f1207a8fbf861"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.114",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2728,9 +2901,9 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
 name = "polymarket-client-sdk"
-version = "0.3.3"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb87b5a645248751d1f2f1b2155fb5735b872e76ec065bf49087f10665cd0d93"
+checksum = "206811ad44e46f4621425effd6051a01ceac522d846b838b1f2428b74250087e"
 dependencies = [
  "alloy",
  "async-stream",
@@ -2743,7 +2916,6 @@ dependencies = [
  "dashmap",
  "futures",
  "hmac",
- "once_cell",
  "phf",
  "rand 0.9.2",
  "reqwest 0.13.1",
@@ -2751,9 +2923,9 @@ dependencies = [
  "rust_decimal_macros",
  "secrecy",
  "serde",
+ "serde_html_form",
  "serde_json",
  "serde_repr",
- "serde_urlencoded",
  "serde_with",
  "sha2",
  "strum_macros",
@@ -3178,6 +3350,44 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
+version = "0.12.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "futures-core",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
+ "hyper 1.8.1",
+ "hyper-rustls",
+ "hyper-util",
+ "js-sys",
+ "log",
+ "percent-encoding",
+ "pin-project-lite",
+ "quinn",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sync_wrapper 1.0.2",
+ "tokio",
+ "tokio-rustls",
+ "tower",
+ "tower-http",
+ "tower-service",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "webpki-roots",
+]
+
+[[package]]
+name = "reqwest"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04e9018c9d814e5f30cc16a0f03271aeab3571e609612d9fe78c1aa8d11c2f62"
@@ -3391,6 +3601,7 @@ checksum = "c665f33d38cea657d9614f766881e4d510e0eda4239891eea56b4cadcf01801b"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -3682,6 +3893,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_html_form"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0946d52b4b7e28823148aebbeceb901012c595ad737920d504fa8634bb099e6f"
+dependencies = [
+ "form_urlencoded",
+ "indexmap 2.13.0",
+ "itoa",
+ "ryu",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_json"
 version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3911,6 +4135,15 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "strum"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
+dependencies = [
+ "strum_macros",
+]
 
 [[package]]
 name = "strum_macros"
@@ -4220,6 +4453,18 @@ checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
  "rustls",
  "tokio",
+]
+
+[[package]]
+name = "tokio-stream"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -4592,6 +4837,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmtimer"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c598d6b99ea013e35844697fc4670d08339d5cda15588f193c6beedd12f644b"
+dependencies = [
+ "futures",
+ "js-sys",
+ "parking_lot",
+ "pin-utils",
+ "slab",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "web-sys"
 version = "0.3.85"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4616,6 +4875,15 @@ name = "webpki-root-certs"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36a29fc0408b113f68cf32637857ab740edfafdf460c326cd2afaa2d84cc05dc"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12bed680863276c63889429bfd6cab3b99943659923822de1c8a39c49e4d722c"
 dependencies = [
  "rustls-pki-types",
 ]
