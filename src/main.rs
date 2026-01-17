@@ -1617,7 +1617,7 @@ async fn find_arb_opportunity<S: Signer + Sync>(
             .arb_positions
             .values()
             .filter(|p| !p.resolved)
-            .map(|p| p.target_size * p.cost_per_share * Decimal::from(2)) // Both sides
+            .map(|p| p.target_size * p.cost_per_share) // cost_per_share = YES_price + NO_price already
             .sum();
         (locked.balance, arb_exposure)
     };
@@ -1637,8 +1637,8 @@ async fn find_arb_opportunity<S: Signer + Sync>(
         .unwrap_or(Decimal::from_parts(7, 0, 0, false, 1));
     let max_arb_exposure = balance * max_exposure_decimal;
     let remaining_headroom = max_arb_exposure.saturating_sub(total_arb_exposure);
-    // exposure = size * price_sum * 2 (both sides), so max_size = headroom / (price_sum * 2)
-    let max_size_from_exposure = remaining_headroom / (price_sum * Decimal::from(2));
+    // exposure = size * price_sum (cost_per_share = YES+NO already), so max_size = headroom / price_sum
+    let max_size_from_exposure = remaining_headroom / price_sum;
 
     // Take minimum of Kelly, MAX_ARB_SIZE, and exposure-limited size
     let size = kelly_size
