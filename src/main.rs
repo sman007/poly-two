@@ -1152,7 +1152,7 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
         return Err("STALE_ORDER_TIMEOUT_SECS must be > 0".into());
     }
 
-    let main_loop_interval_ms = parse_u64_env("MAIN_LOOP_INTERVAL_MS", "500")?;
+    let main_loop_interval_ms = parse_u64_env("MAIN_LOOP_INTERVAL_MS", "100")?;
     if main_loop_interval_ms == 0 {
         return Err("MAIN_LOOP_INTERVAL_MS must be > 0".into());
     }
