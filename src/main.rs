@@ -1558,20 +1558,23 @@ async fn find_arb_opportunity<S: Signer + Sync>(
     // With defaults (edge=0.03, variance=0.01, kelly=0.2): 60% of balance per trade
     let kelly_multiplier = (config.edge / config.variance) * config.kelly_fraction;
     let kelly_size = Decimal::from_f64(kelly_multiplier).unwrap_or(ARB_SIZE_PCT) * balance;
-    let size = kelly_size.min(MAX_ARB_SIZE).round_dp(2);
+
+    // Cap position size by exposure limit (max 30% of balance in arb positions)
+    let max_arb_exposure = balance * Decimal::from_parts(30, 0, 0, false, 2); // 30%
+    let remaining_headroom = max_arb_exposure.saturating_sub(total_arb_exposure);
+    // exposure = size * price_sum * 2 (both sides), so max_size = headroom / (price_sum * 2)
+    let max_size_from_exposure = remaining_headroom / (price_sum * Decimal::from(2));
+
+    // Take minimum of Kelly, MAX_ARB_SIZE, and exposure-limited size
+    let size = kelly_size
+        .min(MAX_ARB_SIZE)
+        .min(max_size_from_exposure)
+        .round_dp(2);
 
     if size <= Decimal::ZERO {
-        warn!("Skipping arb: non-positive size");
-        return Ok(());
-    }
-
-    // Check exposure cap (max 30% of balance in arb positions)
-    let max_arb_exposure = balance * Decimal::from_parts(30, 0, 0, false, 2); // 30%
-    let new_exposure = size * price_sum * Decimal::from(2); // Both sides
-    if total_arb_exposure + new_exposure > max_arb_exposure {
         debug!(
-            "Skipping arb: exposure cap ({:.2} + {:.2} > {:.2})",
-            total_arb_exposure, new_exposure, max_arb_exposure
+            "Skipping arb: no headroom (exposure {:.2}/{:.2})",
+            total_arb_exposure, max_arb_exposure
         );
         return Ok(());
     }
