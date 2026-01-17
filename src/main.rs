@@ -1008,6 +1008,60 @@ async fn periodic_cleanup(
                     });
                     let removed_paper = before_paper - locked.paper_orders.len();
 
+                    // CRITICAL: Simulate 15-minute market resolution for arb positions
+                    // Reference Wallet: positions resolve in 15 min, freeing capital for new arbs
+                    const RESOLUTION_TIME_SECS: u64 = 15 * 60; // 15 minutes
+
+                    // Collect resolutions first to avoid borrow conflicts
+                    let resolutions: Vec<(String, Decimal, Decimal, Decimal)> = locked
+                        .arb_positions
+                        .iter()
+                        .filter(|(_, arb)| {
+                            !arb.resolved
+                                && now.saturating_sub(arb.created_at) >= RESOLUTION_TIME_SECS
+                        })
+                        .map(|(id, arb)| {
+                            let filled = arb.yes_filled.min(arb.no_filled);
+                            let payout = filled * Decimal::ONE;
+                            let profit_per_share = Decimal::ONE - arb.cost_per_share;
+                            let profit = filled * profit_per_share;
+                            (id.clone(), payout, profit, profit_per_share)
+                        })
+                        .collect();
+
+                    // Apply resolutions
+                    let mut total_payout = Decimal::ZERO;
+                    let mut total_profit = Decimal::ZERO;
+                    for (id, payout, profit, profit_per_share) in &resolutions {
+                        if let Some(arb) = locked.arb_positions.get_mut(id) {
+                            let filled = arb.yes_filled.min(arb.no_filled);
+                            arb.resolved = true;
+                            arb.resolved_pnl = *profit;
+                            total_payout += payout;
+                            total_profit += profit;
+                            info!(
+                                "[PAPER] ARB RESOLVED: {} | Filled: {:.2} | Payout: ${:.2} | Profit: ${:.2} ({:.2}%)",
+                                arb.id,
+                                filled,
+                                payout,
+                                profit,
+                                profit_per_share * Decimal::from(100)
+                            );
+                        }
+                    }
+
+                    if !resolutions.is_empty() {
+                        locked.paper_balance += total_payout;
+                        locked.paper_realized_pnl += total_profit;
+                        locked.arb_positions_resolved += resolutions.len() as u64;
+                        info!(
+                            "[PAPER] Resolved {} arb positions, total payout: ${:.2}, profit: ${:.2}",
+                            resolutions.len(),
+                            total_payout,
+                            total_profit
+                        );
+                    }
+
                     // Periodic paper trading summary
                     let starting_bal = config.paper_starting_balance;
                     let current_bal = locked.paper_balance;
@@ -1216,7 +1270,7 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     }
 
     // Cleanup configuration with validation
-    let cleanup_interval_secs = parse_u64_env("CLEANUP_INTERVAL_SECS", "300")?;
+    let cleanup_interval_secs = parse_u64_env("CLEANUP_INTERVAL_SECS", "30")?; // Faster for resolution checks
     if cleanup_interval_secs == 0 {
         return Err("CLEANUP_INTERVAL_SECS must be > 0".into());
     }
