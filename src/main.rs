@@ -153,7 +153,9 @@ fn get_15min_window_timestamps() -> Vec<u64> {
 
 /// Fetch 15-minute crypto UP/DOWN markets by querying specific slugs
 /// Format: {asset}-updown-15m-{timestamp} (e.g., btc-updown-15m-1768587300)
-async fn discover_15min_markets(http_client: &HttpClient) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+async fn discover_15min_markets(
+    http_client: &HttpClient,
+) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
     let timestamps = get_15min_window_timestamps();
     let mut pairs = Vec::new();
     let mut found_slugs = Vec::new();
@@ -340,7 +342,8 @@ impl ArbPosition {
 
     /// Check if position is balanced (YES and NO fills are equal)
     fn is_balanced(&self) -> bool {
-        (self.yes_filled - self.no_filled).abs() < Decimal::from_parts(1, 0, 0, false, 2) // 0.01 tolerance
+        (self.yes_filled - self.no_filled).abs() < Decimal::from_parts(1, 0, 0, false, 2)
+        // 0.01 tolerance
     }
 
     /// Get imbalance amount (positive = more YES, negative = more NO)
@@ -509,7 +512,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(_) => {
             if config.manual_market_pairs.is_empty() {
                 warn!("No 15-minute crypto markets found and no manual markets configured");
-                warn!("Bot will keep scanning for markets every {} seconds", MARKET_REFRESH_SECS);
+                warn!(
+                    "Bot will keep scanning for markets every {} seconds",
+                    MARKET_REFRESH_SECS
+                );
             }
             config.manual_market_pairs.clone()
         }
@@ -520,7 +526,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let state = Arc::new(RwLock::new(BotState {
-        balance: if config.paper_trade { config.paper_starting_balance } else { Decimal::ZERO },
+        balance: if config.paper_trade {
+            config.paper_starting_balance
+        } else {
+            Decimal::ZERO
+        },
         exposure: HashMap::new(),
         open_orders: HashMap::new(),
         paper_balance: config.paper_starting_balance,
@@ -551,18 +561,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if config.paper_trade {
         info!("══════════════════════════════════════════════════════════════");
         info!("   PAPER TRADING MODE - ARBITRAGE STRATEGY (Reference Wallet)");
-        info!("   Strategy: Buy YES + NO when sum < ${:.2}", ARB_THRESHOLD_MAKER);
+        info!(
+            "   Strategy: Buy YES + NO when sum < ${:.2}",
+            ARB_THRESHOLD_MAKER
+        );
         info!("   Starting balance: ${}", config.paper_starting_balance);
-        info!("   Size per trade: {:.1}% of balance (max ${})",
-              ARB_SIZE_PCT * Decimal::from(100), MAX_ARB_SIZE);
-        info!("   Maker rebate: {}%", MAKER_REBATE_RATE * Decimal::from(100));
+        info!(
+            "   Size per trade: {:.1}% of balance (max ${})",
+            ARB_SIZE_PCT * Decimal::from(100),
+            MAX_ARB_SIZE
+        );
+        info!(
+            "   Maker rebate: {}%",
+            MAKER_REBATE_RATE * Decimal::from(100)
+        );
         info!("══════════════════════════════════════════════════════════════");
     }
 
     // Get initial token IDs for WebSocket subscription
     let tokens: Vec<String> = {
         let locked = state.read().await;
-        locked.active_markets
+        locked
+            .active_markets
             .iter()
             .flat_map(|(yes, no): &(String, String)| vec![yes.clone(), no.clone()])
             .collect()
@@ -572,7 +592,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match fetch_market_ids(&client, &tokens, &config).await {
             Ok(m) => m,
             Err(e) => {
-                warn!("Failed to fetch market IDs: {}. WS will connect without subscriptions.", e);
+                warn!(
+                    "Failed to fetch market IDs: {}. WS will connect without subscriptions.",
+                    e
+                );
                 Vec::new()
             }
         }
@@ -613,7 +636,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let refresh_http = http_client.clone();
 
     tokio::spawn(async move {
-        periodic_market_refresh(refresh_state, refresh_shutdown, refresh_config, refresh_http).await;
+        periodic_market_refresh(
+            refresh_state,
+            refresh_shutdown,
+            refresh_config,
+            refresh_http,
+        )
+        .await;
     });
 
     // Spawn dashboard web server
@@ -692,10 +721,7 @@ async fn run_main_loop_iteration<S: Signer + Sync>(
                 return;
             }
             Err(_) => {
-                warn!(
-                    "Balance fetch timed out after {}s",
-                    config.api_timeout_secs
-                );
+                warn!("Balance fetch timed out after {}s", config.api_timeout_secs);
                 sleep(Duration::from_millis(config.main_loop_interval_ms)).await;
                 return;
             }
@@ -706,7 +732,8 @@ async fn run_main_loop_iteration<S: Signer + Sync>(
         error!(
             "{}Balance too low: {} (minimum: {}). Shutting down.",
             if config.paper_trade { "[PAPER] " } else { "" },
-            current_balance, config.min_balance
+            current_balance,
+            config.min_balance
         );
         shutdown_token.cancel();
         return;
@@ -863,11 +890,17 @@ async fn cancel_stale_orders(
             Ok(Err(e)) => {
                 // Remove from tracking regardless of error type
                 // Order is either canceled, filled, or doesn't exist - all mean we should stop tracking
-                warn!("Cancel order {} returned error (removing from tracking): {:?}", id, e);
+                warn!(
+                    "Cancel order {} returned error (removing from tracking): {:?}",
+                    id, e
+                );
                 to_remove.push(id);
             }
             Err(_) => {
-                warn!("Timeout canceling order {} (keeping in tracking for retry)", id);
+                warn!(
+                    "Timeout canceling order {} (keeping in tracking for retry)",
+                    id
+                );
                 // Don't remove - will retry on next cycle
             }
         }
@@ -1074,7 +1107,10 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
                 .split(';')
                 .filter_map(|pair| {
                     let parts: Vec<&str> = pair.split(',').collect();
-                    if parts.len() == 2 && !parts[0].trim().is_empty() && !parts[1].trim().is_empty() {
+                    if parts.len() == 2
+                        && !parts[0].trim().is_empty()
+                        && !parts[1].trim().is_empty()
+                    {
                         Some((parts[0].trim().to_string(), parts[1].trim().to_string()))
                     } else {
                         warn!("Skipping invalid market pair: {}", pair);
@@ -1396,12 +1432,14 @@ async fn find_arb_opportunity<S: Signer + Sync>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Track API latency - fetch both orderbooks in parallel
     let start = Instant::now();
-    let req_yes = OrderBookSummaryRequest::builder().token_id(yes_token).build();
-    let req_no = OrderBookSummaryRequest::builder().token_id(no_token).build();
-    let (book_yes_result, book_no_result) = tokio::join!(
-        client.order_book(&req_yes),
-        client.order_book(&req_no)
-    );
+    let req_yes = OrderBookSummaryRequest::builder()
+        .token_id(yes_token)
+        .build();
+    let req_no = OrderBookSummaryRequest::builder()
+        .token_id(no_token)
+        .build();
+    let (book_yes_result, book_no_result) =
+        tokio::join!(client.order_book(&req_yes), client.order_book(&req_no));
     let book_yes = book_yes_result?;
     let book_no = book_no_result?;
     let latency_ms = start.elapsed().as_millis() as u64;
@@ -1446,13 +1484,18 @@ async fn find_arb_opportunity<S: Signer + Sync>(
     info!(
         "{}ARB FOUND: YES_bid={:.4} + NO_bid={:.4} = {:.4} | Profit: {:.2}%",
         if config.paper_trade { "[PAPER] " } else { "" },
-        best_bid_yes, best_bid_no, price_sum, expected_profit_pct
+        best_bid_yes,
+        best_bid_no,
+        price_sum,
+        expected_profit_pct
     );
 
     // Get current balance and calculate position size
     let (balance, total_arb_exposure) = {
         let locked = state.read().await;
-        let arb_exposure: Decimal = locked.arb_positions.values()
+        let arb_exposure: Decimal = locked
+            .arb_positions
+            .values()
             .filter(|p| !p.resolved)
             .map(|p| p.target_size * p.cost_per_share * Decimal::from(2)) // Both sides
             .sum();
@@ -1492,12 +1535,34 @@ async fn find_arb_opportunity<S: Signer + Sync>(
     // Reference Wallet: "Buy YES and NO at best bid (or mid - offset for safety)"
     // Orders rest on book, we earn maker rebate when sellers fill us
     let order_specs = [
-        (yes_token, Side::Buy, best_bid_yes, "Arb Buy YES", base_order_num),
-        (no_token, Side::Buy, best_bid_no, "Arb Buy NO", base_order_num + 1),
+        (
+            yes_token,
+            Side::Buy,
+            best_bid_yes,
+            "Arb Buy YES",
+            base_order_num,
+        ),
+        (
+            no_token,
+            Side::Buy,
+            best_bid_no,
+            "Arb Buy NO",
+            base_order_num + 1,
+        ),
     ];
 
     let order_futures = order_specs.map(|(token, side, price, label, order_num)| {
-        place_single_order(client, signer, token, side, price, size, label, config.paper_trade, order_num)
+        place_single_order(
+            client,
+            signer,
+            token,
+            side,
+            price,
+            size,
+            label,
+            config.paper_trade,
+            order_num,
+        )
     });
 
     let results = futures_util::future::join_all(order_futures).await;
@@ -1571,7 +1636,10 @@ async fn find_arb_opportunity<S: Signer + Sync>(
         info!(
             "{}ARB POSITION OPENED: {} | Size: {} | Cost: {:.4}/share | Expected profit: {:.2}%",
             if config.paper_trade { "[PAPER] " } else { "" },
-            arb_id, size, price_sum, expected_profit_pct
+            arb_id,
+            size,
+            price_sum,
+            expected_profit_pct
         );
 
         if config.paper_trade {
@@ -1886,12 +1954,20 @@ fn simulate_paper_fills(state: &mut BotState, trade: &TradeMessage, _config: &Co
             // Record fill for dashboard
             let fill_record = FillRecord {
                 time: Utc::now().format("%H:%M:%S").to_string(),
-                side: if order.side == Side::Buy { "BUY".to_string() } else { "SELL".to_string() },
+                side: if order.side == Side::Buy {
+                    "BUY".to_string()
+                } else {
+                    "SELL".to_string()
+                },
                 size: format!("{:.2}", fill_size),
                 price: format!("{:.4}", fill_price),
                 value: format!("${:.2}", fill_value),
                 rebate: format!("${:.4}", rebate),
-                pnl: if fill_pnl != Decimal::ZERO { format!("${:.2}", fill_pnl) } else { "-".to_string() },
+                pnl: if fill_pnl != Decimal::ZERO {
+                    format!("${:.2}", fill_pnl)
+                } else {
+                    "-".to_string()
+                },
             };
             state.recent_fills.push(fill_record);
 
@@ -1902,7 +1978,11 @@ fn simulate_paper_fills(state: &mut BotState, trade: &TradeMessage, _config: &Co
 
             info!(
                 "[PAPER] FILL: {} {} @ {:.4} (slippage: {:.4}%) | Value: ${:.2} | Rebate: ${:.4}",
-                if order.side == Side::Buy { "BUY" } else { "SELL" },
+                if order.side == Side::Buy {
+                    "BUY"
+                } else {
+                    "SELL"
+                },
                 fill_size,
                 fill_price,
                 slippage * Decimal::from(100),
@@ -2076,7 +2156,8 @@ async fn poll_trades_for_paper_fills(
         // Get our tracked token IDs
         let tracked_tokens: HashSet<String> = {
             let locked = state.read().await;
-            locked.active_markets
+            locked
+                .active_markets
                 .iter()
                 .flat_map(|(yes, no)| vec![yes.clone(), no.clone()])
                 .collect()
@@ -2095,15 +2176,13 @@ async fn poll_trades_for_paper_fills(
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<Vec<ApiTrade>>().await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        debug!("Failed to parse trades: {:?}", e);
-                        continue;
-                    }
+            Ok(resp) if resp.status().is_success() => match resp.json::<Vec<ApiTrade>>().await {
+                Ok(t) => t,
+                Err(e) => {
+                    debug!("Failed to parse trades: {:?}", e);
+                    continue;
                 }
-            }
+            },
             Ok(resp) => {
                 debug!("Trades API returned {}", resp.status());
                 continue;
@@ -2123,8 +2202,14 @@ async fn poll_trades_for_paper_fills(
         let newest_ts = trades.iter().map(|t| t.timestamp).max().unwrap_or(0);
         if !trades.is_empty() {
             let oldest_ts = trades.iter().map(|t| t.timestamp).min().unwrap_or(0);
-            info!("[POLL] Fetched {} trades, timestamps: {} to {}, last_seen: {}, tracked tokens: {}",
-                trades.len(), oldest_ts, newest_ts, last_seen_timestamp, tracked_tokens.len());
+            info!(
+                "[POLL] Fetched {} trades, timestamps: {} to {}, last_seen: {}, tracked tokens: {}",
+                trades.len(),
+                oldest_ts,
+                newest_ts,
+                last_seen_timestamp,
+                tracked_tokens.len()
+            );
         }
 
         for trade in &trades {
@@ -2140,7 +2225,13 @@ async fn poll_trades_for_paper_fills(
             }
             matched_count += 1;
 
-            info!("[POLL] Matched trade: {} {} @ {} on {}", trade.side, trade.size, trade.price, &trade.asset[..30]);
+            info!(
+                "[POLL] Matched trade: {} {} @ {} on {}",
+                trade.side,
+                trade.size,
+                trade.price,
+                &trade.asset[..30]
+            );
 
             // Convert trade data
             let trade_side = if trade.side.to_uppercase() == "BUY" {
@@ -2164,27 +2255,41 @@ async fn poll_trades_for_paper_fills(
                 let mut locked = state.write().await;
 
                 // Track last trade price for unrealized P&L
-                locked.last_trade_prices.insert(trade.asset.clone(), trade_price);
+                locked
+                    .last_trade_prices
+                    .insert(trade.asset.clone(), trade_price);
 
                 let mut trade_remaining = trade_size;
 
                 // Find matching paper orders with their data
-                let matching_orders: Vec<(String, String, Side, Decimal, Decimal, Decimal)> = locked
-                    .paper_orders
-                    .iter()
-                    .filter(|(_, order)| {
-                        order.token_id == trade.asset && order.filled < order.size && {
-                            match (&order.side, &trade_side) {
-                                (Side::Buy, Side::Sell) => trade_price <= order.price,
-                                (Side::Sell, Side::Buy) => trade_price >= order.price,
-                                _ => false,
+                let matching_orders: Vec<(String, String, Side, Decimal, Decimal, Decimal)> =
+                    locked
+                        .paper_orders
+                        .iter()
+                        .filter(|(_, order)| {
+                            order.token_id == trade.asset && order.filled < order.size && {
+                                match (&order.side, &trade_side) {
+                                    (Side::Buy, Side::Sell) => trade_price <= order.price,
+                                    (Side::Sell, Side::Buy) => trade_price >= order.price,
+                                    _ => false,
+                                }
                             }
-                        }
-                    })
-                    .map(|(id, order)| (id.clone(), order.token_id.clone(), order.side.clone(), order.price, order.size, order.filled))
-                    .collect();
+                        })
+                        .map(|(id, order)| {
+                            (
+                                id.clone(),
+                                order.token_id.clone(),
+                                order.side.clone(),
+                                order.price,
+                                order.size,
+                                order.filled,
+                            )
+                        })
+                        .collect();
 
-                for (order_id, token_id, order_side, order_price, order_size, order_filled) in matching_orders {
+                for (order_id, token_id, order_side, order_price, order_size, order_filled) in
+                    matching_orders
+                {
                     if trade_remaining <= Decimal::ZERO {
                         break;
                     }
@@ -2224,30 +2329,47 @@ async fn poll_trades_for_paper_fills(
                             locked.paper_balance = locked.paper_balance - fill_value + rebate;
 
                             // Track inventory - we now own these tokens
-                            let current_exp = locked.exposure.entry(token_id.clone()).or_insert(Decimal::ZERO);
+                            let current_exp = locked
+                                .exposure
+                                .entry(token_id.clone())
+                                .or_insert(Decimal::ZERO);
                             let old_exp = *current_exp;
                             *current_exp = *current_exp + fill_size;
 
                             // Update entry price using weighted average with actual position
-                            let entry = locked.paper_entry_prices.entry(token_id.clone()).or_insert(Decimal::ZERO);
+                            let entry = locked
+                                .paper_entry_prices
+                                .entry(token_id.clone())
+                                .or_insert(Decimal::ZERO);
                             if old_exp + fill_size > Decimal::ZERO {
-                                *entry = (*entry * old_exp + fill_price * fill_size) / (old_exp + fill_size);
+                                *entry = (*entry * old_exp + fill_price * fill_size)
+                                    / (old_exp + fill_size);
                             } else {
                                 *entry = fill_price;
                             }
                         }
                         Side::Sell => {
                             // Check if we have inventory to sell
-                            let current_exp = locked.exposure.get(&token_id).copied().unwrap_or(Decimal::ZERO);
+                            let current_exp = locked
+                                .exposure
+                                .get(&token_id)
+                                .copied()
+                                .unwrap_or(Decimal::ZERO);
                             if current_exp < fill_size {
                                 // Cannot sell more than we own - skip this fill
-                                warn!("[PAPER] Skipping sell of {} - only have {} inventory",
-                                    fill_size, current_exp);
+                                warn!(
+                                    "[PAPER] Skipping sell of {} - only have {} inventory",
+                                    fill_size, current_exp
+                                );
                                 continue;
                             }
 
                             // Calculate P&L before updating
-                            let entry_price = locked.paper_entry_prices.get(&token_id).copied().unwrap_or(fill_price);
+                            let entry_price = locked
+                                .paper_entry_prices
+                                .get(&token_id)
+                                .copied()
+                                .unwrap_or(fill_price);
                             let pnl = (fill_price - entry_price) * fill_size;
                             locked.paper_realized_pnl = locked.paper_realized_pnl + pnl;
 
@@ -2255,7 +2377,10 @@ async fn poll_trades_for_paper_fills(
                             locked.paper_balance = locked.paper_balance + fill_value + rebate;
 
                             // Reduce inventory
-                            let exp = locked.exposure.entry(token_id.clone()).or_insert(Decimal::ZERO);
+                            let exp = locked
+                                .exposure
+                                .entry(token_id.clone())
+                                .or_insert(Decimal::ZERO);
                             *exp = *exp - fill_size;
 
                             // Clear entry price if position is closed
@@ -2272,7 +2397,11 @@ async fn poll_trades_for_paper_fills(
                     // Calculate fill P&L for display
                     let fill_pnl = match order_side {
                         Side::Sell => {
-                            let entry = locked.paper_entry_prices.get(&token_id).copied().unwrap_or(fill_price);
+                            let entry = locked
+                                .paper_entry_prices
+                                .get(&token_id)
+                                .copied()
+                                .unwrap_or(fill_price);
                             (fill_price - entry) * fill_size
                         }
                         _ => Decimal::ZERO,
@@ -2281,12 +2410,20 @@ async fn poll_trades_for_paper_fills(
                     // Record fill for dashboard
                     let fill_record = FillRecord {
                         time: chrono::Utc::now().format("%H:%M:%S").to_string(),
-                        side: if order_side == Side::Buy { "BUY".to_string() } else { "SELL".to_string() },
+                        side: if order_side == Side::Buy {
+                            "BUY".to_string()
+                        } else {
+                            "SELL".to_string()
+                        },
                         size: format!("{:.2}", fill_size),
                         price: format!("{:.4}", fill_price),
                         value: format!("${:.2}", fill_value),
                         rebate: format!("${:.4}", rebate),
-                        pnl: if fill_pnl != Decimal::ZERO { format!("${:.2}", fill_pnl) } else { "-".to_string() },
+                        pnl: if fill_pnl != Decimal::ZERO {
+                            format!("${:.2}", fill_pnl)
+                        } else {
+                            "-".to_string()
+                        },
                     };
                     locked.recent_fills.push(fill_record);
 
@@ -2310,8 +2447,10 @@ async fn poll_trades_for_paper_fills(
         }
 
         if newer_count > 0 || matched_count > 0 {
-            info!("[POLL] Summary: {} newer, {} matched our tokens, {} processed fills",
-                newer_count, matched_count, fill_count);
+            info!(
+                "[POLL] Summary: {} newer, {} matched our tokens, {} processed fills",
+                newer_count, matched_count, fill_count
+            );
         }
 
         // Update to the max timestamp we've seen so far
@@ -2353,14 +2492,12 @@ async fn run_dashboard_server(app_state: AppState) {
         .with_state(app_state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], DASHBOARD_PORT));
-    info!("Dashboard server starting on http://0.0.0.0:{}", DASHBOARD_PORT);
+    info!(
+        "Dashboard server starting on http://0.0.0.0:{}",
+        DASHBOARD_PORT
+    );
 
-    if let Err(e) = axum::serve(
-        tokio::net::TcpListener::bind(addr).await.unwrap(),
-        app,
-    )
-    .await
-    {
+    if let Err(e) = axum::serve(tokio::net::TcpListener::bind(addr).await.unwrap(), app).await {
         error!("Dashboard server error: {:?}", e);
     }
 }
@@ -2379,12 +2516,21 @@ async fn api_handler(State(app_state): State<AppState>) -> Json<DashboardData> {
     let mut total_position_cost = Decimal::ZERO;
     let mut total_unrealized_pnl = Decimal::ZERO;
 
-    let positions: Vec<PositionData> = locked.exposure
+    let positions: Vec<PositionData> = locked
+        .exposure
         .iter()
         .filter(|(_, size)| **size > Decimal::ZERO)
         .map(|(token_id, size)| {
-            let entry_price = locked.paper_entry_prices.get(token_id).copied().unwrap_or(Decimal::ZERO);
-            let current_price = locked.last_trade_prices.get(token_id).copied().unwrap_or(entry_price);
+            let entry_price = locked
+                .paper_entry_prices
+                .get(token_id)
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+            let current_price = locked
+                .last_trade_prices
+                .get(token_id)
+                .copied()
+                .unwrap_or(entry_price);
             let cost_basis = *size * entry_price;
             let market_value = *size * current_price;
             let unrealized = market_value - cost_basis;
