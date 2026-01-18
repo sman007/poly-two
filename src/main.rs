@@ -423,6 +423,7 @@ struct DashboardData {
     available_balance: String,
     deployed_capital: String,
     // Clear P&L metrics
+    wallet_balance: String,
     realized_profit: String,
     pending_profit: String,
     total_profit: String,
@@ -2775,6 +2776,7 @@ async fn api_handler(State(app_state): State<AppState>) -> Json<DashboardData> {
         starting_balance: format!("{:.2}", starting),
         available_balance: format!("{:.2}", available),
         deployed_capital: format!("{:.2}", deployed_capital),
+        wallet_balance: format!("{:.2}", starting + total_profit + locked.paper_rebates_earned),
         realized_profit: format!("{:.2}", realized),
         pending_profit: format!("{:.2}", pending_profit),
         total_profit: format!("{:.2}", total_profit),
@@ -2849,6 +2851,17 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     .pnl-positive { color: var(--accent); text-shadow: 0 0 30px rgba(63,185,80,0.4); }
     .pnl-negative { color: var(--danger); text-shadow: 0 0 30px rgba(248,81,73,0.4); }
     .pnl-label { color: var(--muted); font-size: 14px; text-transform: uppercase; letter-spacing: 1px; }
+    .pnl-profit { font-size: 28px; font-weight: 700; color: var(--accent); margin: 8px 0 16px 0; }
+    .pnl-sub-row { display: flex; justify-content: center; gap: 40px; margin-top: 12px; }
+    .pnl-sub-value { font-size: 24px; font-weight: 700; }
+    .status-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; }
+    .status-ok { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+    .status-slow { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+    .status-bad { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
+    .collapsible-toggle { cursor: pointer; user-select: none; }
+    .collapsible-toggle:hover { color: var(--accent); }
+    .collapsible-content { transition: max-height 0.3s ease; overflow: hidden; }
+    .collapsible-content.collapsed { max-height: 0; }
 
     .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 20px; }
     .stat-card {
@@ -2881,6 +2894,38 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
     .uptime { color: var(--muted); font-size: 13px; }
     .last-update { color: var(--muted); font-size: 12px; text-align: center; margin-top: 20px; }
+
+    /* Tablet */
+    @media (max-width: 768px) {
+      body { padding: 12px; }
+      .pnl-main { font-size: 40px; }
+      .pnl-profit { font-size: 22px; }
+      .pnl-hero { padding: 20px; }
+      .pnl-sub-row { gap: 20px; }
+      .pnl-sub-value { font-size: 20px; }
+      .stats-grid { grid-template-columns: repeat(2, 1fr); }
+      .stat-value { font-size: 20px; }
+    }
+
+    /* Phone */
+    @media (max-width: 480px) {
+      body { padding: 8px; }
+      .header { flex-direction: column; gap: 8px; align-items: flex-start; }
+      .pnl-main { font-size: 32px; }
+      .pnl-profit { font-size: 18px; }
+      .pnl-sub-row { flex-direction: column; gap: 12px; }
+      .pnl-sub-value { font-size: 18px; }
+      .stats-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
+      .stat-card { padding: 12px; }
+      .stat-value { font-size: 16px; }
+      .stat-label { font-size: 10px; }
+      .panel { padding: 12px; overflow-x: auto; }
+      table { min-width: 500px; }
+      th, td { padding: 8px; font-size: 11px; }
+      /* Collapsible fills on mobile */
+      .collapsible-toggle { cursor: pointer; user-select: none; }
+      .collapsible-content.collapsed { display: none; }
+    }
   </style>
 </head>
 <body>
@@ -2894,12 +2939,13 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     </div>
 
     <div class="pnl-hero">
-      <div class="pnl-main pnl-positive" id="total-profit">$0.00</div>
-      <div class="pnl-label">Total Profit (Realized + Pending)</div>
-      <div style="margin-top:20px; display:flex; justify-content:center; gap:40px;">
-        <div><span style="font-size:28px; font-weight:700;" id="realized">$0.00</span><br><span class="pnl-label">Realized</span></div>
-        <div><span style="font-size:28px; font-weight:700;" id="pending">$0.00</span><br><span class="pnl-label">Pending</span></div>
-        <div><span style="font-size:28px; font-weight:700;" id="rebates">$0.00</span><br><span class="pnl-label">Rebates</span></div>
+      <div class="pnl-main pnl-positive" id="wallet-balance">$0.00</div>
+      <div class="pnl-label">Wallet Balance</div>
+      <div class="pnl-profit" id="total-profit">+$0.00</div>
+      <div class="pnl-sub-row">
+        <div><span class="pnl-sub-value" id="realized">$0.00</span><br><span class="pnl-label">Realized</span></div>
+        <div><span class="pnl-sub-value" id="pending">$0.00</span><br><span class="pnl-label">Pending</span></div>
+        <div><span class="pnl-sub-value" id="rebates">$0.00</span><br><span class="pnl-label">Rebates</span></div>
       </div>
     </div>
 
@@ -2925,31 +2971,8 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <div class="stat-value" id="open-arbs">0</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Total Fills</div>
-        <div class="stat-value" id="fills">0</div>
-      </div>
-    </div>
-
-    <div class="stats-grid">
-      <div class="stat-card">
-        <div class="stat-label">Markets</div>
-        <div class="stat-value" id="markets">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">WebSocket</div>
-        <div class="stat-value" id="ws-status">--</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">API Latency</div>
-        <div class="stat-value" id="latency">--</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">Loop Count</div>
-        <div class="stat-value" id="loops">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">Orders Placed</div>
-        <div class="stat-value" id="orders-placed">0</div>
+        <div class="stat-label">Status</div>
+        <div class="stat-value" id="status"><span class="status-dot status-ok"></span>OK</div>
       </div>
     </div>
 
@@ -2966,12 +2989,14 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       </table>
     </div>
 
-    <div class="panel">
-      <h2>Recent Fills</h2>
-      <table>
-        <thead><tr><th>Time</th><th>Side</th><th>Size</th><th>Price</th><th>Value</th><th>Rebate</th><th>P&L</th></tr></thead>
-        <tbody id="fills-table"></tbody>
-      </table>
+    <div class="panel fills-panel" id="fills-panel">
+      <h2 class="collapsible-toggle" onclick="toggleFills()">Recent Fills (<span id="fills-count">0</span>) <span id="fills-arrow">▼</span></h2>
+      <div class="collapsible-content" id="fills-content">
+        <table>
+          <thead><tr><th>Time</th><th>Side</th><th>Size</th><th>Price</th><th>Value</th><th>Rebate</th><th>P&L</th></tr></thead>
+          <tbody id="fills-table"></tbody>
+        </table>
+      </div>
     </div>
 
     <div class="last-update" id="timestamp">Loading...</div>
@@ -2991,6 +3016,25 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       return m + 'm ' + s + 's';
     }
 
+    function toggleFills() {
+      const content = document.getElementById('fills-content');
+      const arrow = document.getElementById('fills-arrow');
+      content.classList.toggle('collapsed');
+      arrow.textContent = content.classList.contains('collapsed') ? '▶' : '▼';
+    }
+
+    // Auto-collapse fills on mobile on load
+    if (window.innerWidth <= 480) {
+      document.addEventListener('DOMContentLoaded', function() {
+        const content = document.getElementById('fills-content');
+        const arrow = document.getElementById('fills-arrow');
+        if (content && arrow) {
+          content.classList.add('collapsed');
+          arrow.textContent = '▶';
+        }
+      });
+    }
+
     async function load() {
       try {
         const resp = await fetch('/api/data');
@@ -3000,11 +3044,15 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         document.getElementById('mode').className = 'badge ' + (d.paper_mode ? 'paper' : 'live');
         document.getElementById('uptime').textContent = formatUptime(d.uptime_secs);
 
-        // Main P&L display
+        // Wallet balance (primary)
+        const walletEl = document.getElementById('wallet-balance');
+        walletEl.textContent = '$' + d.wallet_balance;
+
+        // Total profit (secondary)
         const totalProfit = parseFloat(d.total_profit);
         const profitEl = document.getElementById('total-profit');
-        profitEl.textContent = '$' + d.total_profit;
-        profitEl.className = 'pnl-main ' + (totalProfit >= 0 ? 'pnl-positive' : 'pnl-negative');
+        profitEl.textContent = (totalProfit >= 0 ? '+' : '') + '$' + d.total_profit;
+        profitEl.style.color = totalProfit >= 0 ? 'var(--accent)' : 'var(--danger)';
 
         const realizedEl = document.getElementById('realized');
         realizedEl.textContent = '$' + d.realized_profit;
@@ -3022,15 +3070,13 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         document.getElementById('deployed').textContent = '$' + d.deployed_capital;
         document.getElementById('exposure').textContent = d.exposure_pct + ' / ' + d.max_exposure_pct;
         document.getElementById('open-arbs').textContent = d.open_arbs;
-        document.getElementById('fills').textContent = d.total_fills;
 
-        document.getElementById('markets').textContent = d.market_count;
-        const wsEl = document.getElementById('ws-status');
-        wsEl.textContent = d.ws_connected ? 'Connected' : 'Disconnected';
-        wsEl.style.color = d.ws_connected ? 'var(--accent)' : 'var(--danger)';
-        document.getElementById('latency').textContent = d.api_latency_ms + 'ms';
-        document.getElementById('loops').textContent = d.loop_count.toLocaleString();
-        document.getElementById('orders-placed').textContent = d.orders_placed;
+        // Status indicator (WS + latency combined)
+        const statusEl = document.getElementById('status');
+        let statusClass = 'status-ok', statusText = 'OK';
+        if (!d.ws_connected) { statusClass = 'status-bad'; statusText = 'Disconnected'; }
+        else if (d.api_latency_ms > 500) { statusClass = 'status-slow'; statusText = d.api_latency_ms + 'ms'; }
+        statusEl.innerHTML = '<span class="status-dot ' + statusClass + '"></span>' + statusText;
 
         // Error panel
         const errorPanel = document.getElementById('error-panel');
@@ -3052,6 +3098,9 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         }
 
         document.getElementById('timestamp').textContent = 'Last updated: ' + d.timestamp;
+
+        // Update fills count in collapsible header
+        document.getElementById('fills-count').textContent = d.recent_fills.length;
 
         const tbody = document.getElementById('fills-table');
         if (d.recent_fills.length === 0) {
