@@ -1988,15 +1988,6 @@ fn process_trade_sync(
     trade: &TradeMessage,
     config: &Config,
 ) -> Option<(String, Decimal)> {
-    let asset_id_str = u256_to_token(&trade.asset_id);
-    
-    // PT-1 FIX: Only update exposure for our own fills, not all market trades
-    let is_our_fill = if config.paper_trade {
-        state.paper_orders.iter().any(|o| o.token_id == asset_id_str)
-    } else {
-        state.open_orders.keys().any(|_| true)
-    };
-
     // In paper mode, simulate fills for our open orders
     if config.paper_trade {
         simulate_paper_fills(state, trade, config);
@@ -2708,16 +2699,7 @@ async fn run_dashboard_server(app_state: AppState) {
         DASHBOARD_PORT
     );
 
-    // PT-3 FIX: Handle bind error gracefully
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!("Dashboard bind failed on {}: {}. Continuing without dashboard.", addr, e);
-            return;
-        }
-    };
-    
-    if let Err(e) = axum::serve(listener, app).await {
+    if let Err(e) = axum::serve(tokio::net::TcpListener::bind(addr).await.unwrap(), app).await {
         error!("Dashboard server error: {:?}", e);
     }
 }
