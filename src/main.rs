@@ -911,13 +911,15 @@ async fn cancel_stale_orders(
                 to_remove.push(id);
             }
             Ok(Err(e)) => {
-                // Remove from tracking regardless of error type
-                // Order is either canceled, filled, or doesn't exist - all mean we should stop tracking
-                warn!(
-                    "Cancel order {} returned error (removing from tracking): {:?}",
-                    id, e
-                );
-                to_remove.push(id);
+                // PT-2 FIX: Only remove if order is truly gone
+                let err_msg = e.to_string().to_lowercase();
+                if err_msg.contains("not found") || err_msg.contains("already") {
+                    debug!("Order {} gone: {:?}", id, e);
+                    to_remove.push(id);
+                } else {
+                    warn!("Cancel failed for {} (will retry): {:?}", id, e);
+                    // Keep tracking for next cycle
+                }
             }
             Err(_) => {
                 warn!(
