@@ -8,7 +8,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use log::{debug, warn};
 
 /// R8: Market constraints
 #[derive(Debug, Clone, Default)]
@@ -80,7 +80,7 @@ impl TradeAggregator {
             trades.push(trade.clone());
             
             let size: Decimal = trades.iter()
-                .filter_map(|t| t.size.parse().ok())
+                .filter_map(|t| t.size.parse::<Decimal>().ok())
                 .sum();
             let total_value: Decimal = trades.iter()
                 .filter_map(|t| {

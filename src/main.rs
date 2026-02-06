@@ -1995,7 +1995,7 @@ fn process_trade_sync(
     
     // PT-1 FIX: Only update exposure for our own fills, not all market trades
     let is_our_fill = if config.paper_trade {
-        state.paper_orders.iter().any(|o| o.token_id == asset_id_str)
+        state.paper_orders.iter().any(|o| o.1.token_id == asset_id_str)
     } else {
         state.open_orders.keys().any(|_| true)
     };
