@@ -1,4 +1,5 @@
 mod validation;
+use validation::{MarketConstraints, validate_order};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::SocketAddr;
@@ -1522,6 +1523,19 @@ async fn place_single_order<S: Signer + Sync>(
 
     // Real trading mode
     let token_u256 = token_to_u256_sync(token)?;
+    let book = client
+        .order_book(&OrderBookSummaryRequest::builder().token_id(token_u256).build())
+        .await?;
+    let constraints = MarketConstraints {
+        min_order_size: book.min_order_size,
+        tick_size: Decimal::from(book.tick_size),
+        fee_rate_bps: 0,
+    };
+    if let Err(e) = validate_order(size, price, &constraints) {
+        warn!("{} validation failed: {}", label, e);
+        return Ok(None);
+    }
+
     let order = client
         .limit_order()
         .token_id(token_u256)
@@ -1995,20 +2009,34 @@ fn process_trade_sync(
     
     // PT-1 FIX: Only update exposure for our own fills, not all market trades
     let is_our_fill = if config.paper_trade {
-        state.paper_orders.iter().any(|o| o.1.token_id == asset_id_str)
+        false
     } else {
-        state.open_orders.keys().any(|_| true)
+        trade
+            .taker_order_id
+            .as_ref()
+            .map(|id| state.open_orders.contains_key(id))
+            .unwrap_or(false)
+            || trade
+                .maker_orders
+                .iter()
+                .any(|m| state.open_orders.contains_key(&m.order_id))
     };
 
-    // In paper mode, simulate fills for our open orders
-    if config.paper_trade {
-        simulate_paper_fills(state, trade, config);
+    // In paper mode, simulate fills for our open orders and track actual fills
+    let filled_size = if config.paper_trade {
+        simulate_paper_fills(state, trade, config)
+    } else {
+        trade.size
+    };
+
+    if (!config.paper_trade && !is_our_fill) || (config.paper_trade && filled_size <= Decimal::ZERO) {
+        return None;
     }
 
     let delta = if trade.side == Side::Buy {
-        trade.size
+        filled_size
     } else {
-        -trade.size
+        -filled_size
     };
 
     let balance = state.balance;
@@ -2021,10 +2049,10 @@ fn process_trade_sync(
     let current_exposure = *exposure;
     let exposure_abs = current_exposure.abs();
 
-    let rebate = trade.size * config.rebate_rate;
+    let rebate = filled_size * config.rebate_rate;
     info!(
         "Trade detected: Token {}, Side {:?}, Size {}. Estimated rebate: {}",
-        trade.asset_id, trade.side, trade.size, rebate
+        trade.asset_id, trade.side, filled_size, rebate
     );
 
     // Convert to f64 for comparison
@@ -2046,12 +2074,13 @@ fn process_trade_sync(
 }
 
 /// Simulate paper order fills based on market trades
-fn simulate_paper_fills(state: &mut BotState, trade: &TradeMessage, _config: &Config) {
+fn simulate_paper_fills(state: &mut BotState, trade: &TradeMessage, _config: &Config) -> Decimal {
     // Find paper orders for this token that would be filled by this trade
     // - Our BUY orders fill when someone SELLS at or below our price
     // - Our SELL orders fill when someone BUYS at or above our price
     let trade_price = trade.price;
     let mut trade_remaining = trade.size;
+    let mut total_filled = Decimal::ZERO;
 
     // Collect orders to process (can't modify while iterating)
     let matching_orders: Vec<String> = state
@@ -2150,6 +2179,7 @@ fn simulate_paper_fills(state: &mut BotState, trade: &TradeMessage, _config: &Co
             order.filled += fill_size;
             trade_remaining -= fill_size;
             state.paper_fills += 1;
+            total_filled += fill_size;
 
             // Calculate P&L for this fill (for display)
             let fill_pnl = if order.side == Side::Sell {
@@ -2211,6 +2241,7 @@ fn simulate_paper_fills(state: &mut BotState, trade: &TradeMessage, _config: &Co
     state
         .paper_orders
         .retain(|_, order| order.filled < order.size);
+    total_filled
 }
 
 // ============================================================================
